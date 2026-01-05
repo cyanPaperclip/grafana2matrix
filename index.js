@@ -9,11 +9,16 @@ const PORT = process.env.PORT || 3000;
 const MATRIX_HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL || 'https://matrix.org';
 const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN;
 const MATRIX_ROOM_ID = process.env.MATRIX_ROOM_ID;
+const GRAFANA_URL = process.env.GRAFANA_URL;
+const GRAFANA_API_KEY = process.env.GRAFANA_API_KEY;
 
-console.log(MATRIX_ACCESS_TOKEN, MATRIX_ROOM_ID)
+console.log(MATRIX_ACCESS_TOKEN, MATRIX_ROOM_ID, GRAFANA_URL ? 'Grafana URL Set' : 'No Grafana URL');
 
 // In-memory store for active alerts (fingerprints) -> Alert Object
 const activeAlerts = new Map();
+// Map Matrix Event ID -> Alert ID (fingerprint)
+const messageAlertMap = new Map();
+let nextBatch = null;
 
 // Track last summary times for severities
 const lastSummaryTimes = {
@@ -37,13 +42,13 @@ function getAlertId(alert) {
 const sendMatrixNotification = async (messageContent) => {
     if (!MATRIX_ACCESS_TOKEN || !MATRIX_ROOM_ID) {
         console.error('Missing Matrix config, cannot send notification');
-        return;
+        return null;
     }
     const txnId = new Date().getTime() + '_' + Math.random().toString(36).substr(2, 9);
     const url = `${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(MATRIX_ROOM_ID)}/send/m.room.message/${txnId}`;
 
     try {
-        await axios.put(url, {
+        const response = await axios.put(url, {
             body: messageContent,
             format: "org.matrix.custom.html",
             formatted_body: messageContent
@@ -57,10 +62,133 @@ const sendMatrixNotification = async (messageContent) => {
                 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}`
             }
         });
+        return response.data.event_id;
     } catch (error) {
         console.error('Failed to send Matrix notification:', error.message);
+        return null;
     }
 };
+
+async function createGrafanaSilence(alertId, matrixEventId) {
+    const alert = activeAlerts.get(alertId);
+    if (!alert) {
+        console.error('Alert not found for silence:', alertId);
+        return;
+    }
+
+    if (!GRAFANA_URL || !GRAFANA_API_KEY) {
+        console.error('Grafana config missing, cannot silence');
+        return;
+    }
+
+    const matchers = Object.entries(alert.labels).map(([name, value]) => ({
+        name,
+        value,
+        isRegex: false,
+        isEqual: true
+    }));
+
+    const now = new Date();
+    const endsAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24h
+
+    const payload = {
+        matchers,
+        startsAt: now.toISOString(),
+        endsAt: endsAt.toISOString(),
+        createdBy: "MatrixBot",
+        comment: `Silenced via Matrix for 24h`
+    };
+
+    try {
+        await axios.post(`${GRAFANA_URL}/api/alertmanager/grafana/api/v2/silences`, payload, {
+            headers: {
+                'Authorization': `Bearer ${GRAFANA_API_KEY}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        console.log(`Alert ${alertId} silenced successfully.`);
+        await sendMatrixNotification(`🔇 Alert silenced for 24h: ${alert.labels.alertname}`);
+
+        if (matrixEventId) {
+            const reactionTxnId = new Date().getTime() + '_react_' + Math.random().toString(36).substr(2, 9);
+            try {
+                await axios.put(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(MATRIX_ROOM_ID)}/send/m.reaction/${reactionTxnId}`, {
+                    "m.relates_to": {
+                        "rel_type": "m.annotation",
+                        "event_id": matrixEventId,
+                        "key": "☑️"
+                    }
+                }, {
+                    headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
+                });
+            } catch (reactErr) {
+                console.error('Failed to send confirmation reaction:', reactErr.message);
+            }
+        }
+    } catch (error) {
+        console.error('Failed to create silence:', error.message);
+        if (error.response) {
+            console.error('Grafana response:', error.response.data);
+        }
+    }
+}
+
+async function startMatrixSync() {
+    if (!MATRIX_ACCESS_TOKEN) return;
+
+    // Get initial next_batch
+    try {
+        if (!nextBatch) {
+             const res = await axios.get(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/sync?timeout=0`, {
+                headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
+            });
+            nextBatch = res.data.next_batch;
+        }
+    } catch (e) {
+        console.error("Initial sync failed", e.message);
+    }
+
+    const loop = async () => {
+        try {
+            const url = `${MATRIX_HOMESERVER_URL}/_matrix/client/v3/sync?timeout=30000&since=${nextBatch || ''}`;
+            const res = await axios.get(url, {
+                headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
+            });
+            
+            nextBatch = res.data.next_batch;
+            
+            // Process events
+            const rooms = res.data.rooms?.join || {};
+            if (rooms[MATRIX_ROOM_ID]) {
+                 const timeline = rooms[MATRIX_ROOM_ID].timeline?.events || [];
+                 for (const event of timeline) {
+                     if (event.type === 'm.reaction') {
+                         const relatesTo = event.content?.['m.relates_to'];
+                         if (relatesTo && relatesTo.rel_type === 'm.annotation') {
+                             const key = relatesTo.key; // The emoji
+                             const targetEventId = relatesTo.event_id;
+                             
+                             if (key === '🔇' || key === ':mute:') {
+                                 if (messageAlertMap.has(targetEventId)) {
+                                     const alertId = messageAlertMap.get(targetEventId);
+                                     console.log(`Received mute reaction for event ${targetEventId}, alert ${alertId}`);
+                                     await createGrafanaSilence(alertId, targetEventId);
+                                 }
+                             }
+                         }
+                     }
+                 }
+            }
+
+        } catch (error) {
+            console.error('Sync error:', error.message);
+            await new Promise(r => setTimeout(r, 5000)); // Backoff
+        }
+        setImmediate(loop);
+    };
+    
+    loop();
+}
 
 app.post('/webhook', async (req, res) => {
     try {
@@ -126,9 +254,6 @@ app.post('/webhook', async (req, res) => {
                 }
 
                 const links = [];
-                if (isFiring && a.silenceURL) {
-                    links.push(`[Silence Alert](${a.silenceURL})`);
-                }
                 if (ruleUrl) {
                     links.push(`[View in Grafana](${ruleUrl})`);
                 }
@@ -137,7 +262,10 @@ app.post('/webhook', async (req, res) => {
                     matrixMessage += links.join(' | ');
                 }
 
-                await sendMatrixNotification(matrixMessage);
+                const sentEventId = await sendMatrixNotification(matrixMessage);
+                if (sentEventId && isFiring) {
+                     messageAlertMap.set(sentEventId, id);
+                }
             }
 
         } 
@@ -265,4 +393,5 @@ setInterval(checkSummaries, 60 * 1000);
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
     listJoinedRooms();
+    startMatrixSync();
 });
