@@ -12,8 +12,14 @@ const MATRIX_ROOM_ID = process.env.MATRIX_ROOM_ID;
 
 console.log(MATRIX_ACCESS_TOKEN, MATRIX_ROOM_ID)
 
-// In-memory store for active alerts (fingerprints) to prevent duplicate notifications
-const activeAlerts = new Set();
+// In-memory store for active alerts (fingerprints) -> Alert Object
+const activeAlerts = new Map();
+
+// Track last summary times for severities
+const lastSummaryTimes = {
+    CRIT: Date.now(),
+    WARN: Date.now()
+};
 
 app.use(express.json());
 
@@ -28,6 +34,34 @@ function getAlertId(alert) {
     return crypto.createHash('md5').update(labelString).digest('hex');
 }
 
+const sendMatrixNotification = async (messageContent) => {
+    if (!MATRIX_ACCESS_TOKEN || !MATRIX_ROOM_ID) {
+        console.error('Missing Matrix config, cannot send notification');
+        return;
+    }
+    const txnId = new Date().getTime() + '_' + Math.random().toString(36).substr(2, 9);
+    const url = `${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(MATRIX_ROOM_ID)}/send/m.room.message/${txnId}`;
+
+    try {
+        await axios.put(url, {
+            body: messageContent,
+            format: "org.matrix.custom.html",
+            formatted_body: messageContent
+                .replace(/\n/g, '<br>')
+                .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+                .replace(/## (.*?)(\n|<br>)/, '<h3>$1</h3>')
+                .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>'),
+            msgtype: "m.text"
+        }, {
+            headers: {
+                'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}`
+            }
+        });
+    } catch (error) {
+        console.error('Failed to send Matrix notification:', error.message);
+    }
+};
+
 app.post('/webhook', async (req, res) => {
     try {
         const data = req.body;
@@ -38,26 +72,6 @@ app.post('/webhook', async (req, res) => {
             console.error('MATRIX_ACCESS_TOKEN or MATRIX_ROOM_ID is not defined in environment variables');
             return res.status(500).send('Server configuration error');
         }
-
-        const sendMatrixNotification = async (messageContent) => {
-            const txnId = new Date().getTime() + '_' + Math.random().toString(36).substr(2, 9);
-            const url = `${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(MATRIX_ROOM_ID)}/send/m.room.message/${txnId}`;
-
-            await axios.put(url, {
-                body: messageContent,
-                format: "org.matrix.custom.html",
-                formatted_body: messageContent
-                    .replace(/\n/g, '<br>')
-                    .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
-                    .replace(/## (.*?)(\n|<br>)/, '<h3>$1</h3>')
-                    .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>'),
-                msgtype: "m.text"
-            }, {
-                headers: {
-                    'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}`
-                }
-            });
-        };
 
         // Handle Grafana Unified Alerting (Prometheus style)
         if (data.alerts && Array.isArray(data.alerts)) {
@@ -71,11 +85,10 @@ app.post('/webhook', async (req, res) => {
 
                 if (alertStatus === 'firing') {
                     if (!activeAlerts.has(id)) {
-                        activeAlerts.add(id);
                         alertsToNotify.push(alert);
-                    } else {
-                        console.log(`Skipping duplicate firing alert: ${id}`);
                     }
+                    // Always update/add the alert to map to keep latest state
+                    activeAlerts.set(id, alert);
                 } else if (alertStatus === 'resolved') {
                     if (activeAlerts.has(id)) {
                         activeAlerts.delete(id);
@@ -87,8 +100,8 @@ app.post('/webhook', async (req, res) => {
             }
 
             if (alertsToNotify.length === 0) {
-                console.log('No state changes detected (all alerts are duplicates). Skipping Matrix notification.');
-                return res.status(200).send('No notification needed');
+                console.log('No state changes detected (all alerts are duplicates). Skipping individual Matrix notification.');
+                return res.status(200).send('Processed');
             }
 
             // Send separate message for each alert
@@ -189,6 +202,65 @@ async function listJoinedRooms() {
         console.error('Failed to fetch joined rooms:', error.message);
     }
 }
+
+// Periodic Summary Logic
+const checkSummaries = async () => {
+    const now = Date.now();
+    const CRIT_INTERVAL = parseInt(process.env.SUMMARY_INTERVAL_CRIT_MS) || 2 * 60 * 60 * 1000; // Default 2 hours
+    const WARN_INTERVAL = parseInt(process.env.SUMMARY_INTERVAL_WARN_MS) || 4 * 60 * 60 * 1000; // Default 4 hours
+
+    const sendSummary = async (severity) => {
+        const alertsForSeverity = [];
+        for (const alert of activeAlerts.values()) {
+            const sev = alert.labels?.severity || 'UNKNOWN';
+            if (sev === severity) {
+                alertsForSeverity.push(alert);
+            }
+        }
+
+        if (alertsForSeverity.length > 0) {
+            console.log(`Sending summary for severity: ${severity}`);
+            
+            // Group by host
+            const alertsByHost = {};
+            for (const alert of alertsForSeverity) {
+                const host = alert.labels?.host || alert.labels?.instance || 'Unknown Host';
+                if (!alertsByHost[host]) {
+                    alertsByHost[host] = [];
+                }
+                alertsByHost[host].push(alert);
+            }
+
+            const sortedHosts = Object.keys(alertsByHost).sort();
+            let summaryMessage = `## 📋 ${severity} Alert Summary\n\n`;
+            
+            for (const host of sortedHosts) {
+                summaryMessage += `**Host: ${host}**\n`;
+                for (const alert of alertsByHost[host]) {
+                    const alertName = alert.labels?.alertname || 'Unknown Alert';
+                    const summary = alert.annotations?.summary || alert.annotations?.description || '';
+                    summaryMessage += `- ${alertName}${summary ? `: ${summary}` : ''}\n`;
+                }
+                summaryMessage += `\n`;
+            }
+
+            await sendMatrixNotification(summaryMessage);
+        }
+    };
+
+    if (now - lastSummaryTimes.CRIT >= CRIT_INTERVAL) {
+        await sendSummary('CRIT');
+        lastSummaryTimes.CRIT = now;
+    }
+
+    if (now - lastSummaryTimes.WARN >= WARN_INTERVAL) {
+        await sendSummary('WARN');
+        lastSummaryTimes.WARN = now;
+    }
+};
+
+// Check every minute
+setInterval(checkSummaries, 60 * 1000);
 
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
