@@ -1,6 +1,5 @@
 require('dotenv').config();
 const express = require('express');
-const axios = require('axios');
 
 const crypto = require('crypto');
 
@@ -48,21 +47,30 @@ const sendMatrixNotification = async (messageContent) => {
     const url = `${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(MATRIX_ROOM_ID)}/send/m.room.message/${txnId}`;
 
     try {
-        const response = await axios.put(url, {
-            body: messageContent,
-            format: "org.matrix.custom.html",
-            formatted_body: messageContent
-                .replace(/\n/g, '<br>')
-                .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
-                .replace(/## (.*?)(\n|<br>)/, '<h3>$1</h3>')
-                .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>'),
-            msgtype: "m.text"
-        }, {
+        const response = await fetch(url, {
+            method: 'PUT',
+            body: JSON.stringify({
+                body: messageContent,
+                format: "org.matrix.custom.html",
+                formatted_body: messageContent
+                    .replace(/\n/g, '<br>')
+                    .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+                    .replace(/## (.*?)(\n|<br>)/, '<h3>$1</h3>')
+                    .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>'),
+                msgtype: "m.text"
+            }),
             headers: {
-                'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}`
+                'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}`,
+                'Content-Type': 'application/json'
             }
         });
-        return response.data.event_id;
+
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        return data.event_id;
     } catch (error) {
         console.error('Failed to send Matrix notification:', error.message);
         return null;
@@ -100,36 +108,50 @@ async function createGrafanaSilence(alertId, matrixEventId) {
     };
 
     try {
-        await axios.post(`${GRAFANA_URL}/api/alertmanager/grafana/api/v2/silences`, payload, {
+        const response = await fetch(`${GRAFANA_URL}/api/alertmanager/grafana/api/v2/silences`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
             headers: {
                 'Authorization': `Bearer ${GRAFANA_API_KEY}`,
                 'Content-Type': 'application/json'
             }
         });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            console.error('Grafana response:', errorData);
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
         console.log(`Alert ${alertId} silenced successfully.`);
         await sendMatrixNotification(`🔇 Alert silenced for 24h: ${alert.labels.alertname}`);
 
         if (matrixEventId) {
             const reactionTxnId = new Date().getTime() + '_react_' + Math.random().toString(36).substr(2, 9);
             try {
-                await axios.put(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(MATRIX_ROOM_ID)}/send/m.reaction/${reactionTxnId}`, {
-                    "m.relates_to": {
-                        "rel_type": "m.annotation",
-                        "event_id": matrixEventId,
-                        "key": "☑️"
+                const reactRes = await fetch(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(MATRIX_ROOM_ID)}/send/m.reaction/${reactionTxnId}`, {
+                    method: 'PUT',
+                    body: JSON.stringify({
+                        "m.relates_to": {
+                            "rel_type": "m.annotation",
+                            "event_id": matrixEventId,
+                            "key": "☑️"
+                        }
+                    }),
+                    headers: {
+                        'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}`,
+                        'Content-Type': 'application/json'
                     }
-                }, {
-                    headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
                 });
+                if (!reactRes.ok) {
+                    throw new Error(`HTTP error! status: ${reactRes.status}`);
+                }
             } catch (reactErr) {
                 console.error('Failed to send confirmation reaction:', reactErr.message);
             }
         }
     } catch (error) {
         console.error('Failed to create silence:', error.message);
-        if (error.response) {
-            console.error('Grafana response:', error.response.data);
-        }
     }
 }
 
@@ -139,10 +161,12 @@ async function startMatrixSync() {
     // Get initial next_batch
     try {
         if (!nextBatch) {
-             const res = await axios.get(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/sync?timeout=0`, {
+             const res = await fetch(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/sync?timeout=0`, {
                 headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
             });
-            nextBatch = res.data.next_batch;
+            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+            const data = await res.json();
+            nextBatch = data.next_batch;
         }
     } catch (e) {
         console.error("Initial sync failed", e.message);
@@ -151,14 +175,16 @@ async function startMatrixSync() {
     const loop = async () => {
         try {
             const url = `${MATRIX_HOMESERVER_URL}/_matrix/client/v3/sync?timeout=30000&since=${nextBatch || ''}`;
-            const res = await axios.get(url, {
+            const res = await fetch(url, {
                 headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
             });
+            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+            const data = await res.json();
             
-            nextBatch = res.data.next_batch;
+            nextBatch = data.next_batch;
             
             // Process events
-            const rooms = res.data.rooms?.join || {};
+            const rooms = data.rooms?.join || {};
             if (rooms[MATRIX_ROOM_ID]) {
                  const timeline = rooms[MATRIX_ROOM_ID].timeline?.events || [];
                  for (const event of timeline) {
@@ -264,6 +290,7 @@ app.post('/webhook', async (req, res) => {
 
                 const sentEventId = await sendMatrixNotification(matrixMessage);
                 if (sentEventId && isFiring) {
+                     const id = getAlertId(a);
                      messageAlertMap.set(sentEventId, id);
                 }
             }
@@ -292,9 +319,6 @@ app.post('/webhook', async (req, res) => {
 
     } catch (error) {
         console.error('Error processing webhook:', error.message);
-        if (error.response) {
-            console.error('Matrix API Error:', error.response.status, error.response.data);
-        }
         res.status(500).send('Error processing webhook');
     }
 });
@@ -307,20 +331,25 @@ async function listJoinedRooms() {
 
     console.log('Fetching joined rooms...');
     try {
-        const res = await axios.get(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/joined_rooms`, {
+        const res = await fetch(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/joined_rooms`, {
             headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
         });
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+        const data = await res.json();
 
-        const rooms = res.data.joined_rooms || [];
+        const rooms = data.joined_rooms || [];
         console.log(`Joined to ${rooms.length} rooms:`);
 
         for (const roomId of rooms) {
             let name = '';
             try {
-                const nameRes = await axios.get(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.name`, {
+                const nameRes = await fetch(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.name`, {
                     headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
                 });
-                name = nameRes.data.name;
+                if (nameRes.ok) {
+                    const nameData = await nameRes.json();
+                    name = nameData.name;
+                }
             } catch (err) {
                 // Ignore errors fetching name (e.g. 404 if not set)
             }
