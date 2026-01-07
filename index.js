@@ -27,6 +27,11 @@ const lastSummaryTimes = {
 
 app.use(express.json());
 
+app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+    next();
+});
+
 // Helper to generate a unique ID for an alert if fingerprint is missing
 function getAlertId(alert) {
     if (alert.fingerprint) return alert.fingerprint;
@@ -39,6 +44,7 @@ function getAlertId(alert) {
 }
 
 const sendMatrixNotification = async (messageContent) => {
+    console.log(`Sending Matrix notification (length: ${messageContent.length})`);
     if (!MATRIX_ACCESS_TOKEN || !MATRIX_ROOM_ID) {
         console.error('Missing Matrix config, cannot send notification');
         return null;
@@ -70,6 +76,7 @@ const sendMatrixNotification = async (messageContent) => {
         }
 
         const data = await response.json();
+        console.log(`Matrix event sent: ${data.event_id}`);
         return data.event_id;
     } catch (error) {
         console.error('Failed to send Matrix notification:', error.message);
@@ -125,11 +132,6 @@ async function createGrafanaSilence(alertId, matrixEventId) {
 
         console.log(`Alert ${alertId} silenced successfully.`);
         
-        // Mark locally as silenced
-        if (activeAlerts.has(alertId)) {
-            activeAlerts.get(alertId).silencedUntil = endsAt;
-        }
-
         await sendMatrixNotification(`🔇 Alert silenced for 24h: ${alert.labels.alertname}`);
 
         if (matrixEventId) {
@@ -245,19 +247,18 @@ app.post('/webhook', async (req, res) => {
 
                 if (alertStatus === 'firing') {
                     if (!activeAlerts.has(id)) {
+                        console.log(`New firing alert: ${id} (${alert.labels?.alertname})`);
                         alertsToNotify.push(alert);
                         alert.mentionsSent = { primary: false, secondary: false };
                     } else {
                         const existing = activeAlerts.get(id);
                         alert.mentionsSent = existing.mentionsSent || { primary: false, secondary: false };
-                        if (existing.silencedUntil) {
-                            alert.silencedUntil = existing.silencedUntil;
-                        }
                     }
                     // Always update/add the alert to map to keep latest state
                     activeAlerts.set(id, alert);
                 } else if (alertStatus === 'resolved') {
                     if (activeAlerts.has(id)) {
+                        console.log(`Alert resolved: ${id} (${alert.labels?.alertname})`);
                         activeAlerts.delete(id);
                         alertsToNotify.push(alert);
                     } else {
@@ -278,7 +279,7 @@ app.post('/webhook', async (req, res) => {
                 const host = a.labels?.host || a.labels?.instance || 'Unknown Host';
                 const summary = a.annotations?.summary || '';
                 const description = a.annotations?.description || a.annotations?.message || '';
-                const severity = (a.labels?.severity || '').toUpperCase();
+                const severity = (a.annotations?.severity || '').toUpperCase();
                 
                 const isFiring = a.status === 'firing';
                 const icon = isFiring ? '🚨' : '✅';
@@ -437,7 +438,7 @@ const checkSummaries = async () => {
         if (!host || !mentionConfig[host]) continue;
 
         const config = mentionConfig[host];
-        const severity = (alert.labels?.severity || '').toUpperCase();
+        const severity = (alert.labels?.severity  ||  alert.annotations?.severity || '').toUpperCase();
         const startsAt = new Date(alert.startsAt).getTime();
         const durationMinutes = (now - startsAt) / (1000 * 60);
 
@@ -486,10 +487,7 @@ const checkSummaries = async () => {
                 const alertName = item.alert.labels?.alertname || 'Unknown Alert';
                 const host = item.alert.labels?.host || item.alert.labels?.instance || 'Unknown Host';
                 
-                const isSilenced = item.alert.silencedUntil && new Date(item.alert.silencedUntil) > Date.now();
-                const silenceIcon = isSilenced ? '🔇 ' : '';
-                
-                msg += `- ${silenceIcon}**${alertName}** on **${host}**\n`;
+                msg += `- **${alertName}** on **${host}**\n`;
             }
             msg += `\nAttention: ${group.users.join(' ')}`;
             await sendMatrixNotification(msg);
@@ -499,8 +497,18 @@ const checkSummaries = async () => {
     const sendSummary = async (severity) => {
         const alertsForSeverity = [];
         for (const alert of activeAlerts.values()) {
-            const sev = alert.labels?.severity || 'UNKNOWN';
-            if (sev === severity) {
+            const sev = (alert.annotations?.severity || 'UNKNOWN').toUpperCase();
+            let matches = false;
+            
+            if (severity === 'CRIT') {
+                matches = (sev === 'CRIT' || sev === 'CRITICAL');
+            } else if (severity === 'WARN') {
+                matches = (sev === 'WARN' || sev === 'WARNING');
+            } else {
+                matches = (sev === severity);
+            }
+
+            if (matches) {
                 alertsForSeverity.push(alert);
             }
         }
@@ -526,11 +534,8 @@ const checkSummaries = async () => {
                 for (const alert of alertsByHost[host]) {
                     const alertName = alert.labels?.alertname || 'Unknown Alert';
                     const summary = alert.annotations?.summary || alert.annotations?.description || '';
-                    
-                    const isSilenced = alert.silencedUntil && new Date(alert.silencedUntil) > Date.now();
-                    const silenceIcon = isSilenced ? '🔇 ' : '';
-                    
-                    summaryMessage += `- ${silenceIcon}${alertName}${summary ? `: ${summary}` : ''}\n`;
+                                        
+                    summaryMessage += `- ${alertName}${summary ? `: ${summary}` : ''}\n`;
                 }
                 summaryMessage += `\n`;
             }
@@ -540,13 +545,19 @@ const checkSummaries = async () => {
     };
 
     if (now - lastSummaryTimes.CRIT >= CRIT_INTERVAL) {
+        console.log("CRIT Summary")
         await sendSummary('CRIT');
         lastSummaryTimes.CRIT = now;
+    } else {
+        console.log("Next CRIT Summary in", (CRIT_INTERVAL - (now - lastSummaryTimes.CRIT))/60000, "minutes");
     }
 
     if (now - lastSummaryTimes.WARN >= WARN_INTERVAL) {
+        console.log("WARN Summary");
         await sendSummary('WARN');
         lastSummaryTimes.WARN = now;
+    } else {
+        console.log("Next CRIT Summary in", (CRIT_INTERVAL - (now - lastSummaryTimes.CRIT))/60000, "minutes");
     }
 };
 
