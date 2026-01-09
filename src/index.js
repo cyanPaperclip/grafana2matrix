@@ -84,7 +84,7 @@ const sendSummary = async (severity) => {
 
         await matrix.sendMatrixNotification(summaryMessage);
     } else {
-        let summaryMessage = `## 📋 ${severity} Alert Summary\n\n`;
+        let summaryMessage = `## 📋 ${severity} Alert Summary\n`;
         summaryMessage += "No active alerts!"
         await matrix.sendMatrixNotification(summaryMessage)
     }
