@@ -1,17 +1,19 @@
 require('dotenv').config();
 const express = require('express');
-const fs = require('fs');
-
-const crypto = require('crypto');
+const { MatrixServer } = require('./matrix');
+const { createMatrixMessage } = require('./messages');
+const { isCritical, isWarn, getMentionConfig } = require('./util');
 
 const app = express();
+
 const PORT = process.env.PORT || 3000;
 const MATRIX_HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL || 'https://matrix.org';
 const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN;
 const MATRIX_ROOM_ID = process.env.MATRIX_ROOM_ID;
 const GRAFANA_URL = process.env.GRAFANA_URL;
 const GRAFANA_API_KEY = process.env.GRAFANA_API_KEY;
-
+const SUMMARY_SCHEDULE_CRIT = process.env.SUMMARY_SCHEDULE_CRIT;
+const SUMMARY_SCHEDULE_WARN = process.env.SUMMARY_SCHEDULE_WARN;
 
 // In-memory store for active alerts (fingerprints) -> Alert Object
 const activeAlerts = new Map();
@@ -25,62 +27,60 @@ const lastSentSchedule = {
     WARN: -1
 };
 
-app.use(express.json());
-
-app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
-    next();
-});
-
-// Helper to generate a unique ID for an alert if fingerprint is missing
-function getAlertId(alert) {
-    if (alert.fingerprint) return alert.fingerprint;
-    // Fallback: Hash the labels
-    const labelString = Object.entries(alert.labels || {})
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([k, v]) => `${k}=${v}`)
-        .join(',');
-    return crypto.createHash('md5').update(labelString).digest('hex');
+if (!MATRIX_ACCESS_TOKEN || !MATRIX_ROOM_ID || !MATRIX_HOMESERVER_URL) {
+    throw new Error("MATRIX_ACCESS_TOKEN or MATRIX_ROOM_ID or MATRIX_HOMESERVER_URL is not defined in environment variables");
 }
 
-const sendMatrixNotification = async (messageContent) => {
-    console.log(`Sending Matrix notification (length: ${messageContent.length})`);
-    if (!MATRIX_ACCESS_TOKEN || !MATRIX_ROOM_ID) {
-        console.error('Missing Matrix config, cannot send notification');
-        return null;
-    }
-    const txnId = new Date().getTime() + '_' + Math.random().toString(36).substr(2, 9);
-    const url = `${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(MATRIX_ROOM_ID)}/send/m.room.message/${txnId}`;
 
-    try {
-        const response = await fetch(url, {
-            method: 'PUT',
-            body: JSON.stringify({
-                body: messageContent,
-                format: "org.matrix.custom.html",
-                formatted_body: messageContent
-                    .replace(/\n/g, '<br>')
-                    .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
-                    .replace(/## (.*?)(\n|<br>)/, '<h3>$1</h3>')
-                    .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>'),
-                msgtype: "m.text"
-            }),
-            headers: {
-                'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}`,
-                'Content-Type': 'application/json'
-            }
-        });
+const matrix = new MatrixServer(MATRIX_HOMESERVER_URL, MATRIX_ROOM_ID, MATRIX_ACCESS_TOKEN);
 
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+const sendSummary = async (severity) => {
+    const alertsForSeverity = [];
+    for (const alert of activeAlerts.values()) {
+        const sev = (alert.annotations?.severity || 'UNKNOWN').toUpperCase();
+        let matches = false;
+        
+        if (isCritical(severity)) {
+            matches = isCritical(sev);
+        } else if (isWarn(severity)) {
+            matches = isWarn(sev);
+        } else {
+            matches = (sev === severity);
         }
 
-        const data = await response.json();
-        console.log(`Matrix event sent: ${data.event_id}`);
-        return data.event_id;
-    } catch (error) {
-        console.error('Failed to send Matrix notification:', error.message);
-        return null;
+        if (matches) {
+            alertsForSeverity.push(alert);
+        }
+    }
+
+    if (alertsForSeverity.length > 0) {
+        console.log(`Sending summary for severity: ${severity}`);
+        
+        // Group by host
+        const alertsByHost = {};
+        for (const alert of alertsForSeverity) {
+            const host = alert.labels?.host || alert.labels?.instance || 'Unknown Host';
+            if (!alertsByHost[host]) {
+                alertsByHost[host] = [];
+            }
+            alertsByHost[host].push(alert);
+        }
+
+        const sortedHosts = Object.keys(alertsByHost).sort();
+        let summaryMessage = `## 📋 ${severity} Alert Summary\n\n`;
+        
+        for (const host of sortedHosts) {
+            summaryMessage += `**Host: ${host}**\n`;
+            for (const alert of alertsByHost[host]) {
+                const alertName = alert.labels?.alertname || 'Unknown Alert';
+                const summary = alert.annotations?.summary || alert.annotations?.description || '';
+                                    
+                summaryMessage += `- ${alertName}${summary ? `: ${summary}` : ''}\n`;
+            }
+            summaryMessage += `\n`;
+        }
+
+        await matrix.sendMatrixNotification(summaryMessage);
     }
 };
 
@@ -110,7 +110,7 @@ async function createGrafanaSilence(alertId, matrixEventId) {
         matchers,
         startsAt: now.toISOString(),
         endsAt: endsAt.toISOString(),
-        createdBy: "MatrixBot",
+        createdBy: "Grafana2Matrix",
         comment: `Silenced via Matrix for 24h`
     };
 
@@ -132,31 +132,10 @@ async function createGrafanaSilence(alertId, matrixEventId) {
 
         console.log(`Alert ${alertId} silenced successfully.`);
         
-        await sendMatrixNotification(`🔇 Alert silenced for 24h: ${alert.annotations.severity} ${alert.labels.host} ${alert.labels.alertname}`);
+        await matrix.sendMatrixNotification(`🔇 Alert silenced for 24h: ${alert.annotations.severity} ${alert.labels.host} ${alert.labels.alertname}`);
 
         if (matrixEventId) {
-            const reactionTxnId = new Date().getTime() + '_react_' + Math.random().toString(36).substr(2, 9);
-            try {
-                const reactRes = await fetch(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(MATRIX_ROOM_ID)}/send/m.reaction/${reactionTxnId}`, {
-                    method: 'PUT',
-                    body: JSON.stringify({
-                        "m.relates_to": {
-                            "rel_type": "m.annotation",
-                            "event_id": matrixEventId,
-                            "key": "☑️"
-                        }
-                    }),
-                    headers: {
-                        'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}`,
-                        'Content-Type': 'application/json'
-                    }
-                });
-                if (!reactRes.ok) {
-                    throw new Error(`HTTP error! status: ${reactRes.status}`);
-                }
-            } catch (reactErr) {
-                console.error('Failed to send confirmation reaction:', reactErr.message);
-            }
+            matrix.sendReaction(matrixEventId);
         }
     } catch (error) {
         console.error('Failed to create silence:', error.message);
@@ -164,16 +143,10 @@ async function createGrafanaSilence(alertId, matrixEventId) {
 }
 
 async function startMatrixSync() {
-    if (!MATRIX_ACCESS_TOKEN) return;
-
     // Get initial next_batch
     try {
         if (!nextBatch) {
-             const res = await fetch(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/sync?timeout=0`, {
-                headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
-            });
-            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-            const data = await res.json();
+            const data = await matrix.getNextBatch();
             nextBatch = data.next_batch;
         }
     } catch (e) {
@@ -182,12 +155,7 @@ async function startMatrixSync() {
 
     const loop = async () => {
         try {
-            const url = `${MATRIX_HOMESERVER_URL}/_matrix/client/v3/sync?timeout=30000&since=${nextBatch || ''}`;
-            const res = await fetch(url, {
-                headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
-            });
-            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-            const data = await res.json();
+            const data = await matrix.getNextBatch(30000, nextBatch || '')
             
             nextBatch = data.next_batch;
             
@@ -230,10 +198,6 @@ app.post('/webhook', async (req, res) => {
         
         console.log('Received webhook:', JSON.stringify(data, null, 2));
 
-        if (!MATRIX_ACCESS_TOKEN || !MATRIX_ROOM_ID) {
-            console.error('MATRIX_ACCESS_TOKEN or MATRIX_ROOM_ID is not defined in environment variables');
-            return res.status(500).send('Server configuration error');
-        }
 
         // Handle Grafana Unified Alerting (Prometheus style)
         if (data.alerts && Array.isArray(data.alerts)) {
@@ -242,7 +206,7 @@ app.post('/webhook', async (req, res) => {
 
             // Filter and Deduplicate
             for (const alert of data.alerts) {
-                const id = getAlertId(alert);
+                const id = alert.fingerprint;
                 const alertStatus = alert.status; // 'firing' or 'resolved'
 
                 if (alertStatus === 'firing') {
@@ -275,79 +239,12 @@ app.post('/webhook', async (req, res) => {
             // Send separate message for each alert
             const mentionConfig = getMentionConfig();
             for (const a of alertsToNotify) {
-                const alertName = a.labels?.alertname || 'Unknown Alert';
-                const host = a.labels?.host || a.labels?.instance || 'Unknown Host';
-                const summary = a.annotations?.summary || '';
-                const description = a.annotations?.description || a.annotations?.message || '';
-                const severity = (a.annotations?.severity || '').toUpperCase();
-                
-                const isFiring = a.status === 'firing';
-                let icon; 
+               
+                const matrixMessage = createMatrixMessage(a);
 
-                if (!isFiring) {
-                    icon = '✅';
-                }
-                else if (severity === "WARN") {
-                    icon = '⚠️';
-                } else {
-                    icon = '🚨';
-                }
-
-                let matrixMessage = `## ${icon} ${severity}: ${alertName} (${host})\n`;
-                
-                if (summary) {
-                    matrixMessage += `${summary}\n`;
-                }
-                
-                if (description) {
-                    matrixMessage += `${description}\n`;
-                }
-
-                // Check for immediate mentions
-                if (isFiring && mentionConfig[host]) {
-                    const config = mentionConfig[host];
-                    let immediateMentions = [];
-
-                    const checkImmediate = (type) => {
-                        const delayCrit = config[`delay_crit_${type}`];
-                        const delayWarn = config[`delay_warn_${type}`];
-
-                        if (severity === 'CRITICAL' || severity === 'CRIT') {
-                            return delayCrit === 0;
-                        } else if (severity === 'WARNING' || severity === 'WARN') {
-                            return delayWarn === 0;
-                        }
-                        return false;
-                    };
-
-                    // Check all applicable types
-                    if (checkImmediate('secondary')) {
-                         immediateMentions.push(...config['secondary']);
-                    } 
-                    if (checkImmediate('primary')) {
-                         immediateMentions.push(...config['primary']);
-                    }
-                    
-                    // Deduplicate
-                    immediateMentions = [...new Set(immediateMentions)];
-
-                    if (immediateMentions.length > 0) {
-                        matrixMessage += `\nAttention: ${immediateMentions.join(' ')}\n`;
-                    }
-                }
-
-                const links = [];
-                // if (ruleUrl) {
-                //     links.push(`[View in Grafana](${ruleUrl})`);
-                // }
-                
-                if (links.length > 0) {
-                    matrixMessage += links.join(' | ');
-                }
-
-                const sentEventId = await sendMatrixNotification(matrixMessage);
-                if (sentEventId && isFiring) {
-                     const id = getAlertId(a);
+                const sentEventId = await matrix.sendMatrixNotification(matrixMessage);
+                if (sentEventId && a.status === 'firing') {
+                     const id = a.fingerprint;
                      messageAlertMap.set(sentEventId, id);
                 }
             }
@@ -368,7 +265,7 @@ app.post('/webhook', async (req, res) => {
                                   `${messageBody}\n\n` +
                                   (ruleUrl ? `[View in Grafana](${ruleUrl})` : '');
 
-            await sendMatrixNotification(matrixMessage);
+            await matrix.sendMatrixNotification(matrixMessage);
         }
         
         console.log('Notification(s) sent to Matrix');
@@ -380,64 +277,13 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-async function listJoinedRooms() {
-    if (!MATRIX_ACCESS_TOKEN) {
-        console.warn('Cannot list rooms: MATRIX_ACCESS_TOKEN is missing.');
-        return;
-    }
-
-    console.log('Fetching joined rooms...');
-    try {
-        const res = await fetch(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/joined_rooms`, {
-            headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
-        });
-        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-        const data = await res.json();
-
-        const rooms = data.joined_rooms || [];
-        console.log(`Joined to ${rooms.length} rooms:`);
-
-        for (const roomId of rooms) {
-            let name = '';
-            try {
-                const nameRes = await fetch(`${MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.name`, {
-                    headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
-                });
-                if (nameRes.ok) {
-                    const nameData = await nameRes.json();
-                    name = nameData.name;
-                }
-            } catch (err) {
-                // Ignore errors fetching name (e.g. 404 if not set)
-            }
-            console.log(`- ${roomId}${name ? ` (${name})` : ''}`);
-        }
-    } catch (error) {
-        console.error('Failed to fetch joined rooms:', error.message);
-    }
-}
-
-// Helper to get mention config
-const getMentionConfig = () => {
-    const configPath = process.env.MENTION_CONFIG_PATH;
-    if (!configPath) return {};
-    try {
-        if (fs.existsSync(configPath)) {
-            return JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        }
-    } catch (e) {
-        console.error('Error reading mention config:', e.message);
-    }
-    return {};
-};
-
 // Periodic Summary Logic
-const checkSummaries = async () => {
+const checkSummariesAndMentions = async () => {
     const now = Date.now();
 
+    // Check for alerts that need mentions
     const mentionConfig = getMentionConfig();
 
-    // Check for alerts that need mentions
     const alertsNeedingMention = [];
     for (const [id, alert] of activeAlerts.entries()) {
         const host = alert.labels?.host || alert.labels?.instance;
@@ -452,9 +298,9 @@ const checkSummaries = async () => {
             const delayCrit = config[`delay_crit_${type}`];
             const delayWarn = config[`delay_warn_${type}`];
 
-            if (severity === 'CRITICAL' || severity === 'CRIT') {
+            if (isCritical(severity)) {
                 return delayCrit >= 0 && durationMinutes >= delayCrit;
-            } else if (severity === 'WARNING' || severity === 'WARN') {
+            } else if (isWarn(severity)) {
                 return delayWarn >= 0 && durationMinutes >= delayWarn;
             }
             return false;
@@ -496,59 +342,9 @@ const checkSummaries = async () => {
                 msg += `- **${alertName}** on **${host}**\n`;
             }
             msg += `\nAttention: ${group.users.join(' ')}`;
-            await sendMatrixNotification(msg);
+            await matrix.sendMatrixNotification(msg);
         }
     }
-
-    const sendSummary = async (severity) => {
-        const alertsForSeverity = [];
-        for (const alert of activeAlerts.values()) {
-            const sev = (alert.annotations?.severity || 'UNKNOWN').toUpperCase();
-            let matches = false;
-            
-            if (severity === 'CRIT') {
-                matches = (sev === 'CRIT' || sev === 'CRITICAL');
-            } else if (severity === 'WARN') {
-                matches = (sev === 'WARN' || sev === 'WARNING');
-            } else {
-                matches = (sev === severity);
-            }
-
-            if (matches) {
-                alertsForSeverity.push(alert);
-            }
-        }
-
-        if (alertsForSeverity.length > 0) {
-            console.log(`Sending summary for severity: ${severity}`);
-            
-            // Group by host
-            const alertsByHost = {};
-            for (const alert of alertsForSeverity) {
-                const host = alert.labels?.host || alert.labels?.instance || 'Unknown Host';
-                if (!alertsByHost[host]) {
-                    alertsByHost[host] = [];
-                }
-                alertsByHost[host].push(alert);
-            }
-
-            const sortedHosts = Object.keys(alertsByHost).sort();
-            let summaryMessage = `## 📋 ${severity} Alert Summary\n\n`;
-            
-            for (const host of sortedHosts) {
-                summaryMessage += `**Host: ${host}**\n`;
-                for (const alert of alertsByHost[host]) {
-                    const alertName = alert.labels?.alertname || 'Unknown Alert';
-                    const summary = alert.annotations?.summary || alert.annotations?.description || '';
-                                        
-                    summaryMessage += `- ${alertName}${summary ? `: ${summary}` : ''}\n`;
-                }
-                summaryMessage += `\n`;
-            }
-
-            await sendMatrixNotification(summaryMessage);
-        }
-    };
 
     const nowUtc = new Date();
     // Calculate minutes from midnight (0-1439)
@@ -607,15 +403,22 @@ const checkSummaries = async () => {
          
     };
 
-    await checkSchedule('CRIT', process.env.SUMMARY_SCHEDULE_CRIT || "6:00,14:30");
-    await checkSchedule('WARN', process.env.SUMMARY_SCHEDULE_WARN || "6:00,14:30");
+    await checkSchedule('CRIT', SUMMARY_SCHEDULE_CRIT || "6:00,14:30");
+    await checkSchedule('WARN', SUMMARY_SCHEDULE_WARN || "6:00,14:30");
 };
 
 // Check every minute
-setInterval(checkSummaries, 60 * 1000);
+setInterval(checkSummariesAndMentions, 60 * 1000);
+
+app.use(express.json());
+
+app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+    next();
+});
 
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
-    listJoinedRooms();
+    matrix.listJoinedRooms();
     startMatrixSync();
 });
