@@ -84,7 +84,10 @@ class MatrixServer extends EventEmitter{
                 body: JSON.stringify({
                     body: messageContent,
                     format: "org.matrix.custom.html",
-                    formatted_body: messageContent,
+                    formatted_body: messageContent.replace(/\n/g, '<br>')
+                    .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+                    .replace(/## (.*?)(\n|<br>)/, '<h3>$1</h3>')
+                    .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>'),
                     msgtype: "m.text"
                 }),
                 headers: {
