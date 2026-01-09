@@ -83,6 +83,10 @@ const sendSummary = async (severity) => {
         }
 
         await matrix.sendMatrixNotification(summaryMessage);
+    } else {
+        let summaryMessage = `## 📋 ${severity} Alert Summary\n\n`;
+        summaryMessage += "No active alerts!"
+        await matrix.sendMatrixNotification(summaryMessage)
     }
 };
 
@@ -155,6 +159,24 @@ matrix.on("reaction", async (reaction) => {
         }
     }
 })
+
+matrix.on("userMessage", async (event) => {
+    const body = event.content?.body;
+    if (!body) {
+        return;
+    } 
+
+    if (body.startsWith(".summary ")) {
+        const parts = body.split(/\s+/);
+        if (parts.length > 1) {
+            const severity = parts[1].toUpperCase();
+            console.log(`Received manual summary request for: ${severity}`);
+            await sendSummary(severity);
+        } else {
+             await matrix.sendMatrixNotification("Usage: .summary <severity> (e.g. CRITICAL, WARNING)");
+        }
+    }
+});
 
 app.post('/webhook', async (req, res) => {
     try {
