@@ -9,19 +9,20 @@ const createMatrixMessage = (a) => {
     const severity = (a.annotations?.severity || '').toUpperCase();
     
     const isFiring = a.status === 'firing';
-    let icon; 
+    let color; 
 
     if (!isFiring) {
-        icon = '✅';
+        color = '#007a00';
     }
-    else if (severity === "WARN") {
-        icon = '⚠️';
+    else if (isWarn(severity)) {
+        color = '#ff9100';
     } else {
-        icon = '🚨';
+        color = '#d20000';
     }
 
-    let matrixMessage = `## ${icon} ${severity}: ${alertName} (${host})\n`;
-    
+    let matrixMessage = `<font color="${color}">**${severity}: ${alertName}</font>\n`;
+    matrixMessage += `**HOST: ${host}**\n`;
+
     if (summary) {
         matrixMessage += `${summary}\n`;
     }
