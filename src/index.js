@@ -1,7 +1,7 @@
 import express from 'express';
 import { MatrixServer } from './matrix.js';
-import { createMatrixMessage } from './messages.js';
-import { isCritical, isWarn, getMentionConfig, parseTimeToMinutes } from './util.js';
+import { createMatrixMessage, createPersistentAlertMessage } from './messages.js';
+import { isCritical, isWarn, getMentionConfig, parseTimeToMinutes, sortAlertsByUsers } from './util.js';
 import { 
     initDB, 
     getAllActiveAlerts, 
@@ -210,6 +210,7 @@ app.post('/webhook', async (req, res) => {
         if (data.alerts && Array.isArray(data.alerts)) {
             const ruleUrl = data.externalURL;
             const alertsToNotify = [];
+            const alertsForPersistentMention = [];
 
             // Filter and Deduplicate
             for (const alert of data.alerts) {
@@ -224,6 +225,52 @@ app.post('/webhook', async (req, res) => {
                     } else {
                         const existing = getActiveAlert(id);
                         alert.mentionsSent = existing.mentionsSent || { primary: false, secondary: false };
+
+                        // Check if repeat is null (send persistent message on every webhook receipt)
+                        const mentionConfig = getMentionConfig();
+                        const host = alert.labels?.host || alert.labels?.instance;
+                        
+                        if (host && mentionConfig[host]) {
+                            const conf = mentionConfig[host];
+                            const severity = (alert.labels?.severity || alert.annotations?.severity || '').toUpperCase();
+                            const startsAt = new Date(alert.startsAt).getTime();
+                            const durationMinutes = (Date.now() - startsAt) / (1000 * 60);
+                            
+                            let usersToMention = [];
+                            
+                            const checkNullAndDelay = (type) => {
+                                 let repeat = undefined;
+                                 let delay = -1;
+                                 if (isCritical(severity)) {
+                                     repeat = conf[`repeat_crit_${type}`];
+                                     delay = conf[`delay_crit_${type}`];
+                                 } else if (isWarn(severity)) {
+                                     repeat = conf[`repeat_warn_${type}`];
+                                     delay = conf[`delay_warn_${type}`];
+                                 }
+                                 
+                                 if (repeat === undefined || repeat === null) {
+                                     if (delay >= 0 && durationMinutes >= delay) {
+                                         return true;
+                                     }
+                                 }
+                                 return false;
+                            };
+
+                            if (checkNullAndDelay('secondary')) {
+                                usersToMention.push(...conf['secondary']);
+                            }
+                            if (checkNullAndDelay('primary')) {
+                                usersToMention.push(...conf['primary']);
+                            }
+                            
+                            usersToMention = [...new Set(usersToMention)];
+                            
+                            if (usersToMention.length > 0) {
+                                 console.log(`Re-firing persistent alert due to repeat=null: ${id}`);
+                                 alertsForPersistentMention.push({ id, alert, users: usersToMention.sort() });
+                            }
+                        }
                     }
                     // Always update/add the alert to map to keep latest state
                     setActiveAlert(id, alert);
@@ -239,13 +286,12 @@ app.post('/webhook', async (req, res) => {
                 }
             }
 
-            if (alertsToNotify.length === 0) {
+            if (alertsToNotify.length === 0 && alertsForPersistentMention.length === 0) {
                 console.log('No state changes detected (all alerts are duplicates). Skipping individual Matrix notification.');
                 return res.status(200).send('Processed');
             }
 
             // Send separate message for each alert
-            const mentionConfig = getMentionConfig();
             for (const a of alertsToNotify) {
                
                 const matrixMessage = createMatrixMessage(a);
@@ -254,6 +300,16 @@ app.post('/webhook', async (req, res) => {
                 if (sentEventId && a.status === 'firing') {
                      const id = a.fingerprint;
                      setMessageMap(sentEventId, id);
+                }
+            }
+
+            // Send persistent notifications if any
+            if (alertsForPersistentMention.length > 0) {
+                const groups = sortAlertsByUsers(alertsForPersistentMention);
+
+                for (const key in groups) {
+                    const msg = createPersistentAlertMessage(groups[key].alerts);
+                    await matrix.sendMatrixNotification(msg);
                 }
             }
 
@@ -303,15 +359,49 @@ const checkSummariesAndMentions = async () => {
         const startsAt = new Date(alert.startsAt).getTime();
         const durationMinutes = (now - startsAt) / (1000 * 60);
 
+        let dirty = false;
+
         const checkMention = (type) => {
             const delayCrit = config[`delay_crit_${type}`];
             const delayWarn = config[`delay_warn_${type}`];
+            
+            const repeatCrit = config[`repeat_crit_${type}`];
+            const repeatWarn = config[`repeat_warn_${type}`];
+
+            let delay = -1;
+            let repeat = undefined;
 
             if (isCritical(severity)) {
-                return delayCrit >= 0 && durationMinutes >= delayCrit;
+                delay = delayCrit;
+                repeat = repeatCrit;
             } else if (isWarn(severity)) {
-                return delayWarn >= 0 && durationMinutes >= delayWarn;
+                delay = delayWarn;
+                repeat = repeatWarn;
             }
+
+            if (delay < 0) return false;
+            if (durationMinutes < delay) return false;
+
+            // Repeat logic
+            if (repeat === undefined || repeat === null) return false; // Handled by webhook
+
+            if (repeat === 0) return true; // Every run
+
+            // Check repeat interval
+            const lastSentKey = `last_sent_${type}`;
+            const lastSent = alert.mentionsSent?.[lastSentKey] || 0;
+            
+            if (repeat < 0) {
+                return lastSent === 0;
+            }
+
+            if ((now - lastSent) >= repeat * 60 * 1000) {
+                 if (!alert.mentionsSent) alert.mentionsSent = {};
+                 alert.mentionsSent[lastSentKey] = now;
+                 dirty = true;
+                 return true;
+            }
+            
             return false;
         };
 
@@ -321,6 +411,10 @@ const checkSummariesAndMentions = async () => {
         }
         if (checkMention('primary')) {
             usersToMention.push(...config['primary']);
+        }
+
+        if (dirty) {
+            setActiveAlert(id, alert);
         }
 
         // Deduplicate
@@ -333,24 +427,10 @@ const checkSummariesAndMentions = async () => {
 
     if (alertsNeedingMention.length > 0) {
         // Group by users to minimize messages
-        const groups = {};
-        for (const item of alertsNeedingMention) {
-            const key = item.users.join(',');
-            if (!groups[key]) groups[key] = { users: item.users, alerts: [] };
-            groups[key].alerts.push(item);
-        }
+        const groups = sortAlertsByUsers(alertsNeedingMention);
 
         for (const key in groups) {
-            const group = groups[key];
-            let msg = `## ⚠️ Persistent Alert Notification\n\n`;
-            msg += `The following alerts have been active for a significant time:\n\n`;
-            for (const item of group.alerts) {
-                const alertName = item.alert.labels?.alertname || 'Unknown Alert';
-                const host = item.alert.labels?.host || item.alert.labels?.instance || 'Unknown Host';
-                
-                msg += `- **${alertName}** on **${host}**\n`;
-            }
-            msg += `\nAttention: ${group.users.map(v => `@${v}`).join(' ')}`;
+            const msg = createPersistentAlertMessage(groups[key].alerts);
             await matrix.sendMatrixNotification(msg);
         }
     }

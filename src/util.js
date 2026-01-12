@@ -22,7 +22,17 @@ const parseTimeToMinutes = (timeStr) => {
     return hours * 60 + minutes;
 };
 
+const sortAlertsByUsers = (alerts) => {
+    const groups = {};
+    for (const item of alerts) {
+        const key = item.users.join(',');
+        if (!groups[key]) groups[key] = { users: item.users, alerts: [] };
+        groups[key].alerts.push(item);
+    }
+    return groups;
+}
+
 const isCritical = (severity) => severity.toUpperCase() === 'CRITICAL' || severity.toUpperCase() === 'CRIT';
 const isWarn  = (severity) => severity.toUpperCase() === 'WARNING' || severity.toUpperCase() === 'WARN';
 
-export { getMentionConfig, isCritical, isWarn, parseTimeToMinutes };
+export { getMentionConfig, isCritical, isWarn, parseTimeToMinutes, sortAlertsByUsers };

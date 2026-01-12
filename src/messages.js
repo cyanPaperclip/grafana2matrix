@@ -78,4 +78,26 @@ const createMatrixMessage = (a) => {
     return matrixMessage;
 }
 
-export { createMatrixMessage };
+const createPersistentAlertMessage = (alertsWithUsers) => {
+    // Expects alertsWithUsers to be an array of { alert, users } where users is the same for all items (logic handled by caller usually)
+    // Actually the caller groups by users, so we can assume users are the same for the group passed in.
+    
+    if (!alertsWithUsers || alertsWithUsers.length === 0) return '';
+    
+    const users = alertsWithUsers[0].users;
+    
+    let msg = `## ⚠️ Persistent Alert Notification\n\n`;
+    msg += `The following alerts have been active for a significant time:\n\n`;
+    
+    for (const item of alertsWithUsers) {
+        const alertName = item.alert.labels?.alertname || 'Unknown Alert';
+        const host = item.alert.labels?.host || item.alert.labels?.instance || 'Unknown Host';
+        
+        msg += `- **${alertName}** on **${host}**\n`;
+    }
+    
+    msg += `\nAttention: ${users.map(v => `@${v}`).join(' ')}`;
+    return msg;
+};
+
+export { createMatrixMessage, createPersistentAlertMessage };
