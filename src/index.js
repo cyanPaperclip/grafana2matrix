@@ -1,7 +1,7 @@
 import express from 'express';
 import { MatrixServer } from './matrix.js';
-import { createMatrixMessage, createPersistentAlertMessage } from './messages.js';
-import { isCritical, isWarn, getMentionConfig, parseTimeToMinutes, sortAlertsByUsers } from './util.js';
+import { createMatrixMessage, createSummaryMessage } from './messages.js';
+import { isCritical, isWarn, checkMentionMessages, checkSchedule } from './util.js';
 import { 
     initDB, 
     getAllActiveAlerts, 
@@ -12,11 +12,9 @@ import {
     getAlertIdFromEvent, 
     hasMessageMap, 
     setMessageMap,
-    deleteMessageMapByAlertId, 
-    getLastSentSchedule, 
-    setLastSentSchedule 
-} from './db.js';
+    deleteMessageMapByAlertId} from './db.js';
 import { config, reloadConfig } from './config.js';
+import { sendGrafanaSilence } from './grafana.js';
 
 const app = express();
 
@@ -55,98 +53,37 @@ const sendSummary = async (severity) => {
         }
     }
 
-    if (alertsForSeverity.length > 0) {
-        console.log(`Sending summary for severity: ${severity}`);
-        
-        // Group by host
-        const alertsByHost = {};
-        for (const alert of alertsForSeverity) {
-            const host = alert.labels?.host || alert.labels?.instance || 'Unknown Host';
-            if (!alertsByHost[host]) {
-                alertsByHost[host] = [];
-            }
-            alertsByHost[host].push(alert);
-        }
-
-        const sortedHosts = Object.keys(alertsByHost).sort();
-        let summaryMessage = `## 📋 ${severity} Alert Summary\n\n`;
-        
-        for (const host of sortedHosts) {
-            summaryMessage += `**Host: ${host}**\n`;
-            for (const alert of alertsByHost[host]) {
-                const alertName = alert.labels?.alertname || 'Unknown Alert';
-                const summary = alert.annotations?.summary || alert.annotations?.description || '';
-                                    
-                summaryMessage += `- ${alertName}${summary ? `: ${summary}` : ''}\n`;
-            }
-            summaryMessage += `\n`;
-        }
-
-        await matrix.sendMatrixNotification(summaryMessage);
-    } else {
-        let summaryMessage = `## 📋 ${severity} Alert Summary\n`;
-        summaryMessage += "No active alerts!"
-        await matrix.sendMatrixNotification(summaryMessage)
-    }
+    console.log(`Sending summary for severity: ${severity}`);
+    
+    const summaryMessage = createSummaryMessage(severity, alertsForSeverity);
+    await matrix.sendMatrixNotification(summaryMessage);
 };
 
 async function createGrafanaSilence(alertId, matrixEventId) {
     const alert = getActiveAlert(alertId);
+
     if (!alert) {
         console.error('Alert not found for silence:', alertId);
         return;
     }
 
-    if (!config.GRAFANA_URL || !config.GRAFANA_API_KEY) {
-        console.error('Grafana config missing, cannot silence');
-        return;
-    }
-
-    const matchers = Object.entries(alert.labels).map(([name, value]) => ({
-        name,
-        value,
-        isRegex: false,
-        isEqual: true
-    }));
-
-    const now = new Date();
-    const endsAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24h
-
-    const payload = {
-        matchers,
-        startsAt: now.toISOString(),
-        endsAt: endsAt.toISOString(),
-        createdBy: "Grafana2Matrix",
-        comment: `Silenced via Matrix for 24h`
-    };
-
-    try {
-        const response = await fetch(`${config.GRAFANA_URL}/api/alertmanager/grafana/api/v2/silences`, {
-            method: 'POST',
-            body: JSON.stringify(payload),
-            headers: {
-                'Authorization': `Bearer ${config.GRAFANA_API_KEY}`,
-                'Content-Type': 'application/json'
-            }
-        });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            console.error('Grafana response:', errorData);
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-
+    const silenceResult = sendGrafanaSilence(alert, Date.now());
+    let reaction = '☑️';
+    if (silenceResult) {
         console.log(`Alert ${alertId} silenced successfully.`);
         
         await matrix.sendMatrixNotification(`🔇 Alert silenced for 24h: ${alert.annotations.severity} ${alert.labels.host} ${alert.labels.alertname}`);
         deleteActiveAlert(alertId);
         deleteMessageMapByAlertId(alertId);
 
-        if (matrixEventId) {
-            matrix.sendReaction(matrixEventId);
-        }
-    } catch (error) {
-        console.error('Failed to create silence:', error.message);
+
+    } else {
+        await matrix.sendMatrixNotification(`Alert could not be silenced: ${alert.annotations.severity} ${alert.labels.host} ${alert.labels.alertname}`);
+        reaction = '⛔️';
+    }
+
+    if (matrixEventId) {
+        matrix.sendReaction(matrixEventId, reaction);
     }
 }
 
@@ -210,7 +147,6 @@ app.post('/webhook', async (req, res) => {
         if (data.alerts && Array.isArray(data.alerts)) {
             const ruleUrl = data.externalURL;
             const alertsToNotify = [];
-            const alertsForPersistentMention = [];
 
             // Filter and Deduplicate
             for (const alert of data.alerts) {
@@ -241,66 +177,15 @@ app.post('/webhook', async (req, res) => {
                 }
             }
 
-            if (alertsToNotify.length === 0 && alertsForPersistentMention.length === 0) {
+            if (alertsToNotify.length === 0) {
                 console.log('No state changes detected (all alerts are duplicates). Skipping individual Matrix notification.');
-                
-                const mentionConfig = getMentionConfig();
-                for (const alert of data.alerts) {
-                    const host = alert.labels?.host || alert.labels?.instance;
-                    const id = alert.fingerprint;
 
-                    if (host && mentionConfig[host]) {
-                        const conf = mentionConfig[host];
-                        const severity = (alert.labels?.severity || alert.annotations?.severity || '').toUpperCase();
-                        const startsAt = new Date(alert.startsAt).getTime();
-                        const durationMinutes = (Date.now() - startsAt) / (1000 * 60);
-                        
-                        let usersToMention = [];
-                        
-                        const checkNullAndDelay = (type) => {
-                                let repeat = undefined;
-                                let delay = -1;
-                                if (isCritical(severity)) {
-                                    repeat = conf[`repeat_crit_${type}`];
-                                    delay = conf[`delay_crit_${type}`];
-                                } else if (isWarn(severity)) {
-                                    repeat = conf[`repeat_warn_${type}`];
-                                    delay = conf[`delay_warn_${type}`];
-                                }
-                                
-                                if (repeat === undefined || repeat === null) {
-                                    if (delay >= 0 && durationMinutes >= delay) {
-                                        return true;
-                                    }
-                                }
-                                return false;
-                        };
+                const messages = checkMentionMessages(data.alerts, "webhook");
 
-                        if (checkNullAndDelay('secondary')) {
-                            usersToMention.push(...conf['secondary']);
-                        }
-                        if (checkNullAndDelay('primary')) {
-                            usersToMention.push(...conf['primary']);
-                        }
-                        
-                        usersToMention = [...new Set(usersToMention)];
-                        
-                        if (usersToMention.length > 0) {
-                            console.log(`Re-firing persistent alert due to repeat=null: ${id}`);
-                            alertsForPersistentMention.push({ id, alert, users: usersToMention.sort() });
-                        }
-
-                        // Send persistent notifications if any
-                        if (alertsForPersistentMention.length > 0) {
-                            const groups = sortAlertsByUsers(alertsForPersistentMention);
-
-                            for (const key in groups) {
-                                const msg = createPersistentAlertMessage(groups[key].alerts);
-                                await matrix.sendMatrixNotification(msg);
-                            }
-                        }
-                    }
+                for (const msg of messages) {
+                    await matrix.sendMatrixNotification(msg);
                 }
+
                 return res.status(200).send('Processed');
             }
 
@@ -345,151 +230,24 @@ app.post('/webhook', async (req, res) => {
 
 // Periodic Summary Logic
 const checkSummariesAndMentions = async () => {
-    const now = Date.now();
 
-    // Check for alerts that need mentions
-    const mentionConfig = getMentionConfig();
+    // Check mentions
+    const messages = checkMentionMessages(getAllActiveAlerts(), "loop");
 
-    const alertsNeedingMention = [];
-    for (const alert of getAllActiveAlerts()) {
-        const id = alert.fingerprint;
-        const host = alert.labels?.host || alert.labels?.instance;
-        if (!host || !mentionConfig[host]) continue;
-
-        const config = mentionConfig[host];
-        const severity = (alert.labels?.severity  ||  alert.annotations?.severity || '').toUpperCase();
-        const startsAt = new Date(alert.startsAt).getTime();
-        const durationMinutes = (now - startsAt) / (1000 * 60);
-
-        let dirty = false;
-
-        const checkMention = (type) => {
-            const delayCrit = config[`delay_crit_${type}`];
-            const delayWarn = config[`delay_warn_${type}`];
-            
-            const repeatCrit = config[`repeat_crit_${type}`];
-            const repeatWarn = config[`repeat_warn_${type}`];
-
-            let delay = -1;
-            let repeat = undefined;
-
-            if (isCritical(severity)) {
-                delay = delayCrit;
-                repeat = repeatCrit;
-            } else if (isWarn(severity)) {
-                delay = delayWarn;
-                repeat = repeatWarn;
-            }
-
-            if (delay < 0) return false;
-            if (durationMinutes < delay) return false;
-
-            // Repeat logic
-            if (repeat === undefined || repeat === null) return false; // Handled by webhook
-
-            if (repeat === 0) return true; // Every run
-
-            // Check repeat interval
-            const lastSentKey = `last_sent_${type}`;
-            const lastSent = alert.mentionsSent?.[lastSentKey] || 0;
-            
-            if (repeat < 0) {
-                return lastSent === 0;
-            }
-
-            if ((now - lastSent) >= repeat * 60 * 1000) {
-                 if (!alert.mentionsSent) alert.mentionsSent = {};
-                 alert.mentionsSent[lastSentKey] = now;
-                 dirty = true;
-                 return true;
-            }
-            
-            return false;
-        };
-
-        let usersToMention = [];
-        if (checkMention('secondary')) {
-            usersToMention.push(...config['secondary']);
-        }
-        if (checkMention('primary')) {
-            usersToMention.push(...config['primary']);
-        }
-
-        if (dirty) {
-            setActiveAlert(id, alert);
-        }
-
-        // Deduplicate
-        usersToMention = [...new Set(usersToMention)];
-
-        if (usersToMention.length > 0) {
-            alertsNeedingMention.push({ id, alert, users: usersToMention.sort() });
-        }
+     for (const msg of messages) {
+        await matrix.sendMatrixNotification(msg);
     }
 
-    if (alertsNeedingMention.length > 0) {
-        // Group by users to minimize messages
-        const groups = sortAlertsByUsers(alertsNeedingMention);
-
-        for (const key in groups) {
-            const msg = createPersistentAlertMessage(groups[key].alerts);
-            await matrix.sendMatrixNotification(msg);
-        }
-    }
-
+    // Check for summaries
     const nowUtc = new Date();
     // Calculate minutes from midnight (0-1439)
     const currentMinutes = nowUtc.getUTCHours() * 60 + nowUtc.getUTCMinutes();
 
-    const checkSchedule = async (severity, scheduleStr) => {
-        if (!scheduleStr) return;
-        
-        // Parse all scheduled times
-        const scheduledMinutes = scheduleStr.split(',')
-            .map(s => parseTimeToMinutes(s.trim()))
-            .filter(m => m >= 0).sort((a,b) => a - b);
-        
-        // Check if any schedule matches the current minute
-        // And ensure we haven't already sent for this specific minute (deduplication)
+    const sendCrit = await checkSchedule('CRIT', currentMinutes, config.SUMMARY_SCHEDULE_CRIT || "6:00,14:30");
+    const sendWarn = await checkSchedule('WARN', currentMinutes, config.SUMMARY_SCHEDULE_WARN || "6:00,14:30");
 
-        let newestPastTime = null;
-        for (const time of scheduledMinutes) {
-            if (time < currentMinutes) {
-                newestPastTime = time;
-                continue;
-            };
-            break;
-        }
-        // We are before the first trigger
-        if (newestPastTime === null) {
-            return;
-        }
-        
-        const lastSent = getLastSentSchedule(severity);
-
-        // check if we have a date rollover 
-        // last checked time is highest possible event &&
-        // last checked time is from the day before (this is to prevent the last alarm at 18:00 clearing the lastSend and then being retriggerd)
-        if (lastSent >= scheduledMinutes.at(-1) && lastSent > currentMinutes) {
-            setLastSentSchedule(severity, -1);
-        }
-        
-        // We have already sent this summary
-        if (newestPastTime === getLastSentSchedule(severity)) {
-            return;
-        }
-
-        // If we hit this code, we are actually sending a summary
-
-        const timeStr = `${Math.floor(currentMinutes / 60).toString().padStart(2, '0')}:${(currentMinutes % 60).toString().padStart(2, '0')}`;
-        console.log(`Triggering ${severity} Summary at ${timeStr} UTC (minute ${currentMinutes})`);
-        
-        await sendSummary(severity);
-        setLastSentSchedule(severity, newestPastTime);
-    };
-
-    await checkSchedule('CRIT', config.SUMMARY_SCHEDULE_CRIT || "6:00,14:30");
-    await checkSchedule('WARN', config.SUMMARY_SCHEDULE_WARN || "6:00,14:30");
+    if (sendCrit) sendSummary("CRIT");
+    if (sendWarn) sendSummary("WARN");
 };
 
 // Check every minute

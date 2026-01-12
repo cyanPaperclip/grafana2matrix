@@ -107,4 +107,39 @@ const createPersistentAlertMessage = (alertsWithUsers) => {
     return msg;
 };
 
-export { createMatrixMessage, createPersistentAlertMessage };
+const createSummaryMessage = (severity, alertsForSeverity) => {
+
+    if (alertsForSeverity.length === 0) {
+        let summaryMessage = `## 📋 ${severity} Alert Summary\n`;
+        summaryMessage += "No active alerts!"
+        return summaryMessage;
+    }
+    
+    // Group by host
+    const alertsByHost = {};
+    for (const alert of alertsForSeverity) {
+        const host = alert.labels?.host || alert.labels?.instance || 'Unknown Host';
+        if (!alertsByHost[host]) {
+            alertsByHost[host] = [];
+        }
+        alertsByHost[host].push(alert);
+    }
+
+    const sortedHosts = Object.keys(alertsByHost).sort();
+
+    let summaryMessage = `## 📋 ${severity} Alert Summary\n\n`;
+        
+    for (const host of sortedHosts) {
+        summaryMessage += `**Host: ${host}**\n`;
+        for (const alert of alertsByHost[host]) {
+            const alertName = alert.labels?.alertname || 'Unknown Alert';
+            const summary = alert.annotations?.summary || alert.annotations?.description || '';
+                                
+            summaryMessage += `- ${alertName}${summary ? `: ${summary}` : ''}\n`;
+        }
+        summaryMessage += `\n`;
+    }
+    return summaryMessage;
+}
+
+export { createMatrixMessage, createPersistentAlertMessage, createSummaryMessage };

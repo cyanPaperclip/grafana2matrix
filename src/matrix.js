@@ -35,7 +35,7 @@ class MatrixServer extends EventEmitter{
         }
         
         // Reset userId so it gets re-fetched with new token/server if needed
-        if (this.homeserver !== homeserver || this,token !== token) {
+        if (this.homeserver !== homeserver || this.token !== token) {
 
             this.homeserver = homeserver;
             this.token = token;
