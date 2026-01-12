@@ -34,6 +34,13 @@ if (!MATRIX_ACCESS_TOKEN || !MATRIX_ROOM_ID || !MATRIX_HOMESERVER_URL) {
 }
 
 
+app.use(express.json());
+
+app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+    next();
+});
+
 const matrix = new MatrixServer(MATRIX_HOMESERVER_URL, MATRIX_ROOM_ID, MATRIX_ACCESS_TOKEN);
 
 const sendSummary = async (severity) => {
@@ -395,13 +402,6 @@ const checkSummariesAndMentions = async () => {
 
 // Check every minute
 setInterval(checkSummariesAndMentions, 60 * 1000);
-
-app.use(express.json());
-
-app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
-    next();
-});
 
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
