@@ -92,7 +92,9 @@ If you use `MENTION_CONFIG_PATH`, create a JSON file (e.g., `mention-config.json
     "delay_crit_primary": 0,    // 0 = Immediate
     "delay_warn_primary": 30,   // Mention after 30 mins
     "delay_crit_secondary": 60,
-    "delay_warn_secondary": -1  // -1 = Never mention
+    "delay_warn_secondary": -1, // -1 = Never mention
+    "repeat_crit_primary": 60,  // Repeat every 60m. null (default)=Every grafana summary, -1=Once
+    "repeat_warn_primary": -1   // Mention once, do not repeat
   }
 }
 ```
