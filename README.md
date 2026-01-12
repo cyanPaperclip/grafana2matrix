@@ -21,7 +21,7 @@ This project is a bridge between Grafana Alerting and Matrix. It receives webhoo
 
 ## Prerequisites
 
-- Node.js (v18+)
+- Node.js (v22.5+)
 - A Matrix account (bot user)
 - A Grafana instance (for alerts and silencing API)
 
@@ -35,7 +35,19 @@ This project is a bridge between Grafana Alerting and Matrix. It receives webhoo
 
 ## Configuration
 
-Create a `.env` file in the root directory with the following variables:
+You can configure the application using environment variables (via a `.env` file) or a JSON configuration file.
+
+### JSON Configuration
+
+By default, the application looks for a `config.json` file in the working directory. You can specify a custom config file using the `--config` argument:
+
+```bash
+npm start -- --config /path/to/my-config.json
+```
+
+### Environment Variables / Config Keys
+
+Create a `.env` file in the root directory or use a JSON file with the following keys:
 
 ```env
 # Server Configuration
@@ -54,6 +66,9 @@ GRAFANA_API_KEY=your_grafana_api_key
 MENTION_CONFIG_PATH=./mention-config.json
 SUMMARY_SCHEDULE_CRIT=08:00,16:00  # UTC times
 SUMMARY_SCHEDULE_WARN=08:00        # UTC times
+
+# Storage
+DB_FILE=alerts.db
 ```
 
 Note that the room id is not the public name of a channel. 
@@ -76,6 +91,8 @@ If you use `MENTION_CONFIG_PATH`, create a JSON file (e.g., `mention-config.json
 }
 ```
 
+This mention config is reloaded when an alert fires and can therefore be updated while the bot runs.
+
 ## Running the Project
 
 Start the server:
@@ -85,6 +102,53 @@ npm start
 ```
 
 On startup, the bot will log a list of joined rooms to the console, which helps you find the `MATRIX_ROOM_ID` if you don't have it.
+
+## Docker
+
+The application can be run as a container. Images are automatically built and published via GitHub Actions.
+
+### Docker CLI
+
+You can run the container directly, passing configuration via environment variables:
+
+```bash
+docker run -d \
+  --name grafana-to-matrix \
+  -p 3000:3000 \
+  -v $(pwd)/alerts.db:/app/alerts.db \
+  -e MATRIX_ACCESS_TOKEN=your_token \
+  -e MATRIX_ROOM_ID=!your_room_id:matrix.org \
+  <IMAGE_NAME>:latest
+```
+
+### Docker Compose
+
+Alternatively, use `docker-compose.yml` for a more persistent setup:
+
+```yaml
+services:
+  grafana-to-matrix:
+    image: <IMAGE_NAME>:latest
+    container_name: grafana-to-matrix
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./alerts.db:/app/alerts.db
+      - ./config.json:/app/config.json:ro
+      # - ./mention-config.json:/app/mention-config.json:ro
+    environment:
+      - MATRIX_HOMESERVER_URL=https://matrix.org
+      - MATRIX_ACCESS_TOKEN=your_token
+      - MATRIX_ROOM_ID=!your_room_id:matrix.org
+      - GRAFANA_URL=https://your-grafana-instance.com
+      - GRAFANA_API_KEY=your_grafana_api_key
+    restart: unless-stopped
+```
+
+Run it with:
+```bash
+docker-compose up -d
+```
 
 ## Usage
 
@@ -96,6 +160,15 @@ On startup, the bot will log a list of joined rooms to the console, which helps 
 3. **Silence Alerts:**
    - React to the alert message with the 🔇 emoji.
    - The bot will call the Grafana API to create a silence and confirm in the chat.
+
+## Chat Commands
+
+The bot supports the following commands in the Matrix room:
+
+- **`.summary <severity>`**: Manually triggers an alert summary for the specified severity.
+  - Example: `.summary CRITICAL` or `.summary WARNING`
+- **`.reload-config`**: Reloads the configuration from disk (both `.env` and `config.json`) without restarting the process. Useful for updating mention configurations or schedules on the fly.
+
 
 ## Alert Labels
 
