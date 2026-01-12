@@ -124,7 +124,7 @@ docker run -d \
   -v $(pwd)/alerts.db:/app/alerts.db \
   -e MATRIX_ACCESS_TOKEN=your_token \
   -e MATRIX_ROOM_ID=!your_room_id:matrix.org \
-  ghcr.io/amaennel/grafana2matrix:2.5:latest
+  ghcr.io/amaennel/grafana2matrix:latest
 ```
 
 ### Docker Compose
