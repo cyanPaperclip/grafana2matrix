@@ -11,7 +11,8 @@ import {
     deleteActiveAlert, 
     getAlertIdFromEvent, 
     hasMessageMap, 
-    setMessageMap, 
+    setMessageMap,
+    deleteMessageMapByAlertId, 
     getLastSentSchedule, 
     setLastSentSchedule 
 } from './db.js';
@@ -139,6 +140,7 @@ async function createGrafanaSilence(alertId, matrixEventId) {
         
         await matrix.sendMatrixNotification(`🔇 Alert silenced for 24h: ${alert.annotations.severity} ${alert.labels.host} ${alert.labels.alertname}`);
         deleteActiveAlert(alertId);
+        deleteMessageMapByAlertId(alertId);
 
         if (matrixEventId) {
             matrix.sendReaction(matrixEventId);
@@ -229,6 +231,7 @@ app.post('/webhook', async (req, res) => {
                     if (hasActiveAlert(id)) {
                         console.log(`Alert resolved: ${id} (${alert.labels?.alertname})`);
                         deleteActiveAlert(id);
+                        deleteMessageMapByAlertId(id);
                         alertsToNotify.push(alert);
                     } else {
                         alertsToNotify.push(alert);
