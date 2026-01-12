@@ -85,7 +85,6 @@ class MatrixServer extends EventEmitter{
                             continue;
                         }
 
-                        console.log(event)
                         if (event.sender !== this.userId) {
                             this.emit('userMessage', event);
                         }
