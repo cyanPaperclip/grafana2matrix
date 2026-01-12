@@ -224,54 +224,9 @@ app.post('/webhook', async (req, res) => {
                         alert.mentionsSent = { primary: false, secondary: false };
                     } else {
                         const existing = getActiveAlert(id);
-                        alert.mentionsSent = existing.mentionsSent || { primary: false, secondary: false };
-
-                        // Check if repeat is null (send persistent message on every webhook receipt)
-                        const mentionConfig = getMentionConfig();
-                        const host = alert.labels?.host || alert.labels?.instance;
-                        
-                        if (host && mentionConfig[host]) {
-                            const conf = mentionConfig[host];
-                            const severity = (alert.labels?.severity || alert.annotations?.severity || '').toUpperCase();
-                            const startsAt = new Date(alert.startsAt).getTime();
-                            const durationMinutes = (Date.now() - startsAt) / (1000 * 60);
-                            
-                            let usersToMention = [];
-                            
-                            const checkNullAndDelay = (type) => {
-                                 let repeat = undefined;
-                                 let delay = -1;
-                                 if (isCritical(severity)) {
-                                     repeat = conf[`repeat_crit_${type}`];
-                                     delay = conf[`delay_crit_${type}`];
-                                 } else if (isWarn(severity)) {
-                                     repeat = conf[`repeat_warn_${type}`];
-                                     delay = conf[`delay_warn_${type}`];
-                                 }
-                                 
-                                 if (repeat === undefined || repeat === null) {
-                                     if (delay >= 0 && durationMinutes >= delay) {
-                                         return true;
-                                     }
-                                 }
-                                 return false;
-                            };
-
-                            if (checkNullAndDelay('secondary')) {
-                                usersToMention.push(...conf['secondary']);
-                            }
-                            if (checkNullAndDelay('primary')) {
-                                usersToMention.push(...conf['primary']);
-                            }
-                            
-                            usersToMention = [...new Set(usersToMention)];
-                            
-                            if (usersToMention.length > 0) {
-                                 console.log(`Re-firing persistent alert due to repeat=null: ${id}`);
-                                 alertsForPersistentMention.push({ id, alert, users: usersToMention.sort() });
-                            }
-                        }
+                        alert.mentionsSent = existing.mentionsSent || { primary: false, secondary: false };    
                     }
+
                     // Always update/add the alert to map to keep latest state
                     setActiveAlert(id, alert);
                 } else if (alertStatus === 'resolved') {
@@ -288,6 +243,64 @@ app.post('/webhook', async (req, res) => {
 
             if (alertsToNotify.length === 0 && alertsForPersistentMention.length === 0) {
                 console.log('No state changes detected (all alerts are duplicates). Skipping individual Matrix notification.');
+                
+                const mentionConfig = getMentionConfig();
+                for (const alert of data.alerts) {
+                    const host = alert.labels?.host || alert.labels?.instance;
+                    const id = alert.fingerprint;
+
+                    if (host && mentionConfig[host]) {
+                        const conf = mentionConfig[host];
+                        const severity = (alert.labels?.severity || alert.annotations?.severity || '').toUpperCase();
+                        const startsAt = new Date(alert.startsAt).getTime();
+                        const durationMinutes = (Date.now() - startsAt) / (1000 * 60);
+                        
+                        let usersToMention = [];
+                        
+                        const checkNullAndDelay = (type) => {
+                                let repeat = undefined;
+                                let delay = -1;
+                                if (isCritical(severity)) {
+                                    repeat = conf[`repeat_crit_${type}`];
+                                    delay = conf[`delay_crit_${type}`];
+                                } else if (isWarn(severity)) {
+                                    repeat = conf[`repeat_warn_${type}`];
+                                    delay = conf[`delay_warn_${type}`];
+                                }
+                                
+                                if (repeat === undefined || repeat === null) {
+                                    if (delay >= 0 && durationMinutes >= delay) {
+                                        return true;
+                                    }
+                                }
+                                return false;
+                        };
+
+                        if (checkNullAndDelay('secondary')) {
+                            usersToMention.push(...conf['secondary']);
+                        }
+                        if (checkNullAndDelay('primary')) {
+                            usersToMention.push(...conf['primary']);
+                        }
+                        
+                        usersToMention = [...new Set(usersToMention)];
+                        
+                        if (usersToMention.length > 0) {
+                            console.log(`Re-firing persistent alert due to repeat=null: ${id}`);
+                            alertsForPersistentMention.push({ id, alert, users: usersToMention.sort() });
+                        }
+
+                        // Send persistent notifications if any
+                        if (alertsForPersistentMention.length > 0) {
+                            const groups = sortAlertsByUsers(alertsForPersistentMention);
+
+                            for (const key in groups) {
+                                const msg = createPersistentAlertMessage(groups[key].alerts);
+                                await matrix.sendMatrixNotification(msg);
+                            }
+                        }
+                    }
+                }
                 return res.status(200).send('Processed');
             }
 
@@ -302,17 +315,6 @@ app.post('/webhook', async (req, res) => {
                      setMessageMap(sentEventId, id);
                 }
             }
-
-            // Send persistent notifications if any
-            if (alertsForPersistentMention.length > 0) {
-                const groups = sortAlertsByUsers(alertsForPersistentMention);
-
-                for (const key in groups) {
-                    const msg = createPersistentAlertMessage(groups[key].alerts);
-                    await matrix.sendMatrixNotification(msg);
-                }
-            }
-
         } 
         // Handle Legacy Grafana Alerting (No deduplication logic applied here as it's singular)
         else {
