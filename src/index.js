@@ -200,6 +200,18 @@ app.post('/webhook', async (req, res) => {
                      setMessageMap(sentEventId, id);
                 }
             }
+
+            // Prune zombie alerts (alerts that are in DB but not in the current webhook request)
+            const receivedAlertIds = new Set(data.alerts.map(a => a.fingerprint));
+            const activeAlerts = getAllActiveAlerts();
+
+            for (const activeAlert of activeAlerts) {
+                if (!receivedAlertIds.has(activeAlert.fingerprint)) {
+                    console.log(`Pruning zombie alert: ${activeAlert.fingerprint} (${activeAlert.labels?.alertname})`);
+                    deleteActiveAlert(activeAlert.fingerprint);
+                    deleteMessageMapByAlertId(activeAlert.fingerprint);
+                }
+            }
         } 
         // Handle Legacy Grafana Alerting (No deduplication logic applied here as it's singular)
         else {
