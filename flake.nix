@@ -12,20 +12,15 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        grafana2matrix = pkgs.buildNpmPackage rec {
+        grafana2matrix = pkgs.buildNpmPackage {
           pname = "grafana2matrix";
           version = "0.1.6";
 
-          src = pkgs.fetchFromGitHub {
-            owner = "amaennel";
-            repo = pname;
-            rev = version;
-            hash = "sha256-LQOU9Uf6bkPRXFyvWHsJ3gyqUwB9ZU4kmp7Vq1bKu0c=";
-          };
+          src = ./.;
 
           npmDepsHash = "sha256-yUDZJSufT7ZgJS0YwJroPutV238ppfvGBQhPQ1fzwOo=";
 
-          nodejs = pkgs.nodejs_22;
+          nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
 
           buildPhase = ''
             runHook preBuild
@@ -41,12 +36,7 @@
 
             # Create wrapper script
             mkdir -p $out/bin
-            cat > $out/bin/grafana2matrix <<EOF
-            #!${pkgs.bash}/bin/bash
-            cd $out/lib/grafana2matrix
-            exec ${pkgs.nodejs_22}/bin/node src/index.js "\$@"
-            EOF
-            chmod +x $out/bin/grafana2matrix
+            makeBinaryWrapper ${pkgs.nodejs}/bin/node $out/bin/grafana2matrix --chdir "$out/lib/grafana2matrix" --add-flags "$out/lib/grafana2matrix/src/index.js"
 
             runHook postInstall
           '';
@@ -67,17 +57,10 @@
           grafana2matrix = grafana2matrix;
         };
 
-        apps = {
-          default = {
-            type = "app";
-            program = "${grafana2matrix}/bin/grafana2matrix";
-          };
-        };
-
         # Development shell
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            nodejs_22
+            pkgs.nodejs
             nodePackages.npm
           ];
         };
@@ -98,6 +81,12 @@
               description = "The grafana2matrix package to use";
             };
 
+            environmentFile = mkOption {
+              type = types.path;
+              default = "/etc/grafana2matrix/env";
+              description = "Path to the environment file defining at least MATRIX_ACCESS_TOKEN and optionally GRAFANA_API_KEY. Can be used to overwrite all options.";
+            };
+
             port = mkOption {
               type = types.port;
               default = 3000;
@@ -110,11 +99,6 @@
               description = "Matrix homeserver URL";
             };
 
-            matrixAccessToken = mkOption {
-              type = types.str;
-              description = "Matrix access token";
-            };
-
             matrixRoomId = mkOption {
               type = types.str;
               example = "!roomid:matrix.org";
@@ -125,11 +109,6 @@
               type = types.str;
               example = "https://your-grafana-instance.com";
               description = "Grafana instance URL (required for Silencing)";
-            };
-
-            grafanaApiKey = mkOption {
-              type = types.str;
-              description = "Grafana API key";
             };
 
             mentionConfig = mkOption {
@@ -253,61 +232,60 @@
 
           config = mkIf cfg.enable {
             # Systemd service and configuration via environment variables
-            systemd.services.grafana2matrix = {
-              description = "Grafana to Matrix webhook adapter";
-              wantedBy = [ "multi-user.target" ];
-              after = [ "network-online.target" ];
-              wants = [ "network-online.target" ];
+            systemd.services.grafana2matrix =
+              let
+                # Create config.json for grafana2matrix
+                configJson = pkgs.writeText "config.json" (
+                  builtins.toJSON (
+                    {
+                      PORT = toString cfg.port;
+                      MATRIX_HOMESERVER_URL = toString cfg.matrixHomeserverUrl;
+                      MATRIX_ROOM_ID = toString cfg.matrixRoomId;
+                      DB_FILE = "/var/lib/${cfg.stateDirectory}/${cfg.dbFilename}";
+                    } // optionalAttrs (cfg.grafanaUrl != null) {
+                      GRAFANA_URL = toString cfg.grafanaUrl;
+                    } // optionalAttrs (cfg.mentionConfig != null) {
+                      MENTION_CONFIG_PATH = pkgs.writeText "mention-config.json" (builtins.toJSON cfg.mentionConfig);
+                    } // optionalAttrs (cfg.summaryScheduleCrit != null) {
+                      SUMMARY_SCHEDULE_CRIT = toString cfg.summaryScheduleCrit;
+                    } // optionalAttrs (cfg.summaryScheduleWarn != null) {
+                      SUMMARY_SCHEDULE_WARN = toString cfg.summaryScheduleWarn;
+                    }
+                  )
+                );
+              in
+              {
+                description = "Grafana to Matrix webhook adapter";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-online.target" ];
+                wants = [ "network-online.target" ];
 
-              serviceConfig = {
-                Type = "simple";
-                User = cfg.user;
-                Group = cfg.group;
-                Restart = "always";
-                RestartSec = "10s";
+                serviceConfig = {
+                  Type = "simple";
+                  User = cfg.user;
+                  Group = cfg.group;
+                  Restart = "always";
+                  RestartSec = "10s";
 
-                # Security hardening
-                NoNewPrivileges = true;
-                PrivateTmp = true;
-                ProtectSystem = "strict";
-                ProtectKernelTunables = true;
-                ProtectKernelModules = true;
-                ProtectControlGroups = true;
-                PrivateDevices = true;
-                RestrictSUIDSGID = true;
-                ProtectHome = true;
+                  # Security hardening
+                  NoNewPrivileges = true;
+                  PrivateTmp = true;
+                  ProtectSystem = "strict";
+                  ProtectKernelTunables = true;
+                  ProtectKernelModules = true;
+                  ProtectControlGroups = true;
+                  PrivateDevices = true;
+                  RestrictSUIDSGID = true;
+                  ProtectHome = true;
 
-                WorkingDirectory = "${cfg.package}/lib/grafana2matrix";
-                StateDirectory = "${cfg.stateDirectory}";
+                  EnvironmentFile = "${cfg.environmentFile}";
 
-                ExecStart = pkgs.writeShellScript "grafana2matrix-start" ''
-                  export PORT=${toString cfg.port}
-                  export MATRIX_HOMESERVER_URL="${cfg.matrixHomeserverUrl}"
-                  export MATRIX_ACCESS_TOKEN="${cfg.matrixAccessToken}"
-                  export MATRIX_ROOM_ID="${cfg.matrixRoomId}"
-                  export DB_FILE="/var/lib/${cfg.stateDirectory}/${cfg.dbFilename}"
+                  WorkingDirectory = "${cfg.package}/lib/grafana2matrix";
+                  StateDirectory = "${cfg.stateDirectory}";
 
-                  ${optionalString (cfg.grafanaUrl != null) ''
-                    export GRAFANA_URL="${cfg.grafanaUrl}"
-                  ''}
-                  ${optionalString (cfg.grafanaApiKey != null) ''
-                    export GRAFANA_API_KEY="${cfg.grafanaApiKey}"
-                  ''}
-                  ${optionalString (cfg.mentionConfig != null) ''
-                    # File mention-config.json is created with contents of option mentionConfig
-                    export MENTION_CONFIG_PATH="${pkgs.writeText "mention-config.json" (builtins.toJSON cfg.mentionConfig)}"
-                  ''}
-                  ${optionalString (cfg.summaryScheduleCrit != null) ''
-                    export SUMMARY_SCHEDULE_CRIT="${cfg.summaryScheduleCrit}"
-                  ''}
-                  ${optionalString (cfg.summaryScheduleWarn != null) ''
-                    export SUMMARY_SCHEDULE_WARN="${cfg.summaryScheduleWarn}"
-                  ''}
-
-                  exec ${pkgs.nodejs_22}/bin/node src/index.js
-                '';
+                  ExecStart = "${cfg.package}/bin/grafana2matrix --config ${configJson}";
+                };
               };
-            };
 
             users.users.${cfg.user} = {
               isSystemUser = true;
