@@ -175,7 +175,9 @@ The bot supports the following commands in the Matrix room:
 
 - **`.summary <severity>`**: Manually triggers an alert summary for the specified severity.
   - Example: `.summary CRITICAL` or `.summary WARNING`
+- **`.silences <severity>`**: Shows actively firing alerts that are currently suppressed by a silence. Takes the severity to filter by as an optional argument.
 - **`.reload-config`**: Reloads the configuration from disk (both `.env` and `config.json`) without restarting the process. Useful for updating mention configurations or schedules on the fly.
+
 
 
 ## Alert Labels

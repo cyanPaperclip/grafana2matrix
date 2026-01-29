@@ -1,7 +1,7 @@
 import express from 'express';
 import { MatrixServer } from './matrix.js';
 import { createMatrixMessage, createSummaryMessage, createSilencesMessage } from './messages.js';
-import { isCritical, isWarn, checkMentionMessages, checkSchedule } from './util.js';
+import { isCritical, isWarn, checkMentionMessages, checkSchedule, getSilencesFilterFunction, getSeverityMatchFunction } from './util.js';
 import { 
     initDB, 
     getAllActiveAlerts, 
@@ -39,14 +39,8 @@ const matrix = new MatrixServer(config.MATRIX_HOMESERVER_URL, config.MATRIX_ROOM
 const sendSummary = async (severity) => {
     const alertsForSeverity = [];
     
-    let matcherFunc = sev => sev === severity;
-    
-    if (isCritical(severity)) {
-        matcherFunc = isCritical;
-    } else if (isWarn(severity)) {
-        matcherFunc = isWarn;
-    }
-    
+    const matcherFunc = getSeverityMatchFunction(severity);
+
     for (const alert of getAllActiveAlerts()) {
         const sev = (alert.labels?.severity || alert.annotations?.severity || 'UNKNOWN').toUpperCase();        
 
@@ -57,7 +51,7 @@ const sendSummary = async (severity) => {
 
     console.log(`Sending summary for severity: ${severity}`);
 
-    const silencesWithSeverity = (await fetchGrafanaSilences()).filter(e => matcherFunc(e.matchers.find(v => v.name === "severity").value));
+    const silencesWithSeverity = (await fetchGrafanaSilences()).filter(getSilencesFilterFunction(severity));
 
     const summaryMessage = createSummaryMessage(severity, alertsForSeverity, silencesWithSeverity);
     await matrix.sendMatrixNotification(summaryMessage);
@@ -125,11 +119,18 @@ matrix.on("userMessage", async (event) => {
         }
     }
 
-    if (body === ".silences") {
+    if (body.startsWith(".silences")) {
         await matrix.sendReaction(event.event_id, '☑️');
+        let filterFunc = () => true;
+        const parts = body.split(/\s+/);
+
+        if (parts.length > 1) {
+            filterFunc = getSilencesFilterFunction(parts[1]);
+        }
+
         try {
             console.log("Fetching silences...");
-            const silences = await fetchGrafanaSilences();
+            const silences = (await fetchGrafanaSilences()).filter(filterFunc);
             const message = createSilencesMessage(silences);
             await matrix.sendMatrixNotification(message);
         } catch (error) {

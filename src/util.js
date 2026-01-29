@@ -177,4 +177,23 @@ const checkSchedule = async (severity, currentMinutes, scheduleStr) => {
         return true;
     };
 
-export { getMentionConfig, isCritical, isWarn, parseTimeToMinutes, sortAlertsByUsers, checkMentionMessages, checkSchedule };
+const getSeverityMatchFunction = (severity) => {
+    let matcherFunc = sev => sev === severity;
+    
+    if (isCritical(severity)) {
+        matcherFunc = isCritical;
+    } else if (isWarn(severity)) {
+        matcherFunc = isWarn;
+    }
+
+    return matcherFunc;
+    
+}
+
+const getSilencesFilterFunction = (severity) => {
+    const matcherFunc = getSeverityMatchFunction(severity);
+
+    return e => matcherFunc(e.matchers.find(v => v.name === "severity").value)
+}
+
+export { getMentionConfig, isCritical, isWarn, parseTimeToMinutes, sortAlertsByUsers, checkMentionMessages, checkSchedule, getSeverityMatchFunction, getSilencesFilterFunction };
