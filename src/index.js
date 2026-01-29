@@ -1,7 +1,7 @@
 import express from 'express';
 import { MatrixServer } from './matrix.js';
-import { createMatrixMessage, createSummaryMessage } from './messages.js';
-import { isCritical, isWarn, checkMentionMessages, checkSchedule } from './util.js';
+import { createMatrixMessage, createSummaryMessage, createSilencesMessage } from './messages.js';
+import { isCritical, isWarn, checkMentionMessages, checkSchedule, getSilencesFilterFunction, getSeverityMatchFunction } from './util.js';
 import { 
     initDB, 
     getAllActiveAlerts, 
@@ -16,7 +16,7 @@ import {
     getBotState,
     setBotState} from './db.js';
 import { config, reloadConfig } from './config.js';
-import { sendGrafanaSilence } from './grafana.js';
+import { sendGrafanaSilence, fetchGrafanaSilences } from './grafana.js';
 
 const app = express();
 
@@ -38,26 +38,22 @@ const matrix = new MatrixServer(config.MATRIX_HOMESERVER_URL, config.MATRIX_ROOM
 
 const sendSummary = async (severity) => {
     const alertsForSeverity = [];
-    for (const alert of getAllActiveAlerts()) {
-        const sev = (alert.labels?.severity || alert.annotations?.severity || 'UNKNOWN').toUpperCase();
-        let matches = false;
-        
-        if (isCritical(severity)) {
-            matches = isCritical(sev);
-        } else if (isWarn(severity)) {
-            matches = isWarn(sev);
-        } else {
-            matches = (sev === severity);
-        }
+    
+    const matcherFunc = getSeverityMatchFunction(severity);
 
-        if (matches) {
+    for (const alert of getAllActiveAlerts()) {
+        const sev = (alert.labels?.severity || alert.annotations?.severity || 'UNKNOWN').toUpperCase();        
+
+        if (matcherFunc(sev)) {
             alertsForSeverity.push(alert);
         }
     }
 
     console.log(`Sending summary for severity: ${severity}`);
-    
-    const summaryMessage = createSummaryMessage(severity, alertsForSeverity);
+
+    const silencesWithSeverity = (await fetchGrafanaSilences()).filter(getSilencesFilterFunction(severity));
+
+    const summaryMessage = createSummaryMessage(severity, alertsForSeverity, silencesWithSeverity);
     await matrix.sendMatrixNotification(summaryMessage);
 };
 
@@ -69,7 +65,7 @@ async function createGrafanaSilence(alertId, matrixEventId) {
         return;
     }
 
-    const silenceResult = sendGrafanaSilence(alert, Date.now());
+    const silenceResult = sendGrafanaSilence(alert, new Date());
     let reaction = '☑️';
     if (silenceResult) {
         console.log(`Alert ${alertId} silenced successfully.`);
@@ -111,7 +107,7 @@ matrix.on("userMessage", async (event) => {
         return;
     } 
 
-    if (body.startsWith(".summary ")) {
+    if (body.startsWith(".summary")) {
         await matrix.sendReaction(event.event_id, '☑️');
         const parts = body.split(/\s+/);
         if (parts.length > 1) {
@@ -120,6 +116,27 @@ matrix.on("userMessage", async (event) => {
             await sendSummary(severity);
         } else {
             await matrix.sendMatrixNotification("Usage: .summary <severity> (e.g. CRITICAL, WARNING)");
+        }
+    }
+
+    if (body.startsWith(".silences")) {
+        await matrix.sendReaction(event.event_id, '☑️');
+        let filterFunc = () => true;
+        const parts = body.split(/\s+/);
+
+        if (parts.length > 1) {
+            filterFunc = getSilencesFilterFunction(parts[1]);
+        }
+
+        try {
+            console.log("Fetching silences...");
+            const silences = (await fetchGrafanaSilences()).filter(filterFunc);
+            const message = createSilencesMessage(silences);
+            await matrix.sendMatrixNotification(message);
+        } catch (error) {
+            console.error("Failed to fetch silences:", error);
+            await matrix.sendReaction(event.event_id, '❌');
+            await matrix.sendMatrixNotification(`Failed to fetch silences: ${error.message}`);
         }
     }
 
@@ -249,38 +266,42 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
+let counter = 0;
 // Periodic Summary Logic
 const checkSummariesAndMentions = async () => {
-    
-    let lastWebhook = getBotState('last_webhook_received');
-    let lastMatrix = getBotState('last_matrix_received');
+    if (counter === 0) {
 
-    if (lastWebhook) {
-        lastWebhook = new Date(lastWebhook).toLocaleString("en-GB");
-    } else {
-        lastWebhook = 'Never';
-    }
+        let lastWebhook = getBotState('last_webhook_received');
+        let lastMatrix = getBotState('last_matrix_received');
 
-    if (lastMatrix) {
-        lastMatrix = new Date(lastMatrix).toLocaleString("en-GB");
-    } else {
-        lastMatrix = 'Never';
-    }
-    const statusMessage = `Last Matrix Check: ${lastMatrix} (UTC) Last Webhook received: ${lastWebhook} (UTC)`;
-    const storedStatusId = getBotState('status_message_id');
-
-    if (storedStatusId) {
-        // Try to edit
-        await matrix.editMessage(storedStatusId, statusMessage);
-    } else {
-        // Create new
-        const newId = await matrix.sendMatrixNotification(statusMessage);
-        await matrix.sendMatrixNotification("The above message will be updated continuously. Consider pining it to the channel.")
-        if (newId) {
-            setBotState('status_message_id', newId);
+        if (lastWebhook) {
+            lastWebhook = new Date(lastWebhook).toLocaleString("en-GB");
+        } else {
+            lastWebhook = 'Never';
         }
-    }
 
+        if (lastMatrix) {
+            lastMatrix = new Date(lastMatrix).toLocaleString("en-GB");
+        } else {
+            lastMatrix = 'Never';
+        }
+        const statusMessage = `Last Matrix Check: ${lastMatrix} (UTC) Last Webhook received: ${lastWebhook} (UTC)`;
+        const storedStatusId = getBotState('status_message_id');
+        
+        if (storedStatusId) {
+            // Try to edit
+            await matrix.editMessage(storedStatusId, statusMessage);
+        } else {
+            // Create new
+            const newId = await matrix.sendMatrixNotification(statusMessage);
+            await matrix.sendMatrixNotification("The above message will be updated continuously. Consider pining it to the channel.")
+            if (newId) {
+                setBotState('status_message_id', newId);
+            }
+        }
+    }   
+    counter = (counter + 1) % 5;
+    
     // Check mentions
     const messages = checkMentionMessages(getAllActiveAlerts(), "loop");
 
