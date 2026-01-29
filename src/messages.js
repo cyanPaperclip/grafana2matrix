@@ -157,7 +157,7 @@ const createSilencesMessage = (silences) => {
         const dateB = new Date(b.endsAt);
         if (isNaN(dateA.getTime())) return 1;
         if (isNaN(dateB.getTime())) return -1;
-        return dateA - dateB;
+        return dateA.getTime() - dateB.getTime();
     });
 
     for (const silence of silences) {
