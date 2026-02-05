@@ -36,13 +36,16 @@ function loadFileConfig() {
 }
 
 const get = (key, defaultValue) => {
-    if (process.env[key] !== undefined) {
-        return process.env[key];
-    }
-    if (fileConfig[key] !== undefined) {
-        return fileConfig[key];
-    }
-    return defaultValue;
+    const value = process.env[key] ?? fileConfig[key];
+
+    if (value === undefined) return defaultValue;
+
+    // While using env variables always produces a string, config.json can indeed contain a boolean.
+    if (typeof value === 'boolean') return value;
+
+    if (value.toLowerCase() === 'true') return true;
+    if (value.toLowerCase() === 'false') return false;
+    return value;
 };
 
 export const config = {};
