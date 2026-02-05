@@ -61,6 +61,7 @@ export function reloadConfig() {
     config.GRAFANA_API_KEY = get('GRAFANA_API_KEY');
     config.SUMMARY_SCHEDULE_CRIT = get('SUMMARY_SCHEDULE_CRIT');
     config.SUMMARY_SCHEDULE_WARN = get('SUMMARY_SCHEDULE_WARN');
+    config.SUMMARY_SCHEDULE_SKIP_EMPTY = get('SUMMARY_SCHEDULE_SKIP_EMPTY', false);
     config.MENTION_CONFIG_PATH = get('MENTION_CONFIG_PATH');
     config.DB_FILE = get('DB_FILE', 'alerts.db');
 }
