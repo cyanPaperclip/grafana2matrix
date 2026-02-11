@@ -211,6 +211,11 @@
               example = "true";
               description = "Do not send empty scheduled alert summaries if true";
             };
+            keepAliveInterval = mkOption {
+              type = types.nullOr types.int;
+              default = null;
+              description = "Update status message every x minutes or disabled if 0";
+            };
 
             dbFilename = mkOption {
               type = types.str;
