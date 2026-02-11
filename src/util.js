@@ -24,6 +24,21 @@ const parseTimeToMinutes = (timeStr) => {
     return hours * 60 + minutes;
 };
 
+const getScheduleTimestamp = (minuteOfDay) => {
+    const now = new Date();
+    const hours = Math.floor(minuteOfDay / 60);
+    const minutes = minuteOfDay % 60;
+    return Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate(),
+        hours,
+        minutes,
+        0,
+        0
+    );
+};
+
 const sortAlertsByUsers = (alerts) => {
     const groups = {};
     for (const item of alerts) {
@@ -130,51 +145,40 @@ const checkMentionMessages = (alerts, strategy) => {
     return messagesToReturn;
 }
 
-const checkSchedule = async (severity, currentMinutes, scheduleStr) => {
+const checkSchedule = async (severity, scheduleStr) => {
         if (!scheduleStr) return false;
         
-        // Parse all scheduled times
-        const scheduledMinutes = scheduleStr.split(',')
+        const scheduledTimestamps = scheduleStr.split(',')
             .map(s => parseTimeToMinutes(s.trim()))
-            .filter(m => m >= 0).sort((a,b) => a - b);
-        
-        // Check if any schedule matches the current minute
-        // And ensure we haven't already sent for this specific minute (deduplication)
+            .filter(m => m >= 0)
+            .sort((a, b) => a - b)
+            .map(minutes => getScheduleTimestamp(minutes));
 
-        let newestPastTime = null;
-        for (const time of scheduledMinutes) {
-            if (time < currentMinutes) {
-                newestPastTime = time;
-                continue;
-            };
-            break;
-        }
-        // We are before the first trigger
-        if (newestPastTime === null) {
-            return false;
-        }
-        
-        const lastSent = getLastSentSchedule(severity);
-
-        // check if we have a date rollover 
-        // last checked time is highest possible event &&
-        // last checked time is from the day before (this is to prevent the last alarm at 18:00 clearing the lastSend and then being retriggerd)
-        if (lastSent >= scheduledMinutes.at(-1) && lastSent > currentMinutes) {
-            setLastSentSchedule(severity, -1);
-        }
-        
-        // We have already sent this summary
-        if (newestPastTime === getLastSentSchedule(severity)) {
+        if (scheduledTimestamps.length === 0) {
             return false;
         }
 
-        // If we hit this code, we are actually sending a summary
+        let lastSent = Number(getLastSentSchedule(severity));
 
-        const timeStr = `${Math.floor(currentMinutes / 60).toString().padStart(2, '0')}:${(currentMinutes % 60).toString().padStart(2, '0')}`;
-        console.log(`Triggering ${severity} Summary at ${timeStr} UTC (minute ${currentMinutes})`);
-        
-        setLastSentSchedule(severity, newestPastTime);
-        return true;
+        // convert old date mode to new (v0.1.9)
+        if (lastSent < 10000) {
+            const convertedLastSent = getScheduleTimestamp(lastSent);
+            setLastSentSchedule(severity, convertedLastSent);
+            lastSent = convertedLastSent;
+        }
+
+        for (const scheduledTimestamp of scheduledTimestamps) {
+
+            if (scheduledTimestamp < Date.now() && lastSent < scheduledTimestamp) {
+                const date = new Date(scheduledTimestamp);
+                console.log(`Triggering ${severity} Summary at ${date.getUTCHours()}:${date.getUTCMinutes()} UTC`);
+    
+                setLastSentSchedule(severity, scheduledTimestamp);
+                return true;
+            }
+
+        }
+
     };
 
 const getSeverityMatchFunction = (severity) => {

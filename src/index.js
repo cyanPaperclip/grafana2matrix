@@ -312,13 +312,8 @@ const checkSummariesAndMentions = async () => {
         await matrix.sendMatrixNotification(msg);
     }
 
-    // Check for summaries
-    const nowUtc = new Date();
-    // Calculate minutes from midnight (0-1439)
-    const currentMinutes = nowUtc.getUTCHours() * 60 + nowUtc.getUTCMinutes();
-
-    const sendCrit = await checkSchedule('CRIT', currentMinutes, config.SUMMARY_SCHEDULE_CRIT || "6:00,14:30");
-    const sendWarn = await checkSchedule('WARN', currentMinutes, config.SUMMARY_SCHEDULE_WARN || "6:00,14:30");
+    const sendCrit = await checkSchedule('CRIT', config.SUMMARY_SCHEDULE_CRIT || "6:00,14:30");
+    const sendWarn = await checkSchedule('WARN', config.SUMMARY_SCHEDULE_WARN || "6:00,14:30");
 
     if (sendCrit) sendSummary("CRIT");
     if (sendWarn) sendSummary("WARN");
