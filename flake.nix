@@ -265,7 +265,7 @@
                     } // optionalAttrs (cfg.summaryScheduleSkipEmpty != null) {
                       SUMMARY_SCHEDULE_SKIP_EMPTY = cfg.summaryScheduleSkipEmpty;
                     } // optionalAttrs (cfg.keepAliveInterval != null) {
-                      KEEP_ALIVE_INTERVAL = cfg.keepAliveInterval;
+                      KEEP_ALIVE_INTERVAL = toString cfg.keepAliveInterval;
                     }
                   )
                 );
