@@ -206,7 +206,7 @@ const getAlertValue = (a, label, defaultValue = undefined) => {
 }
 
 const getAdditionalLabels = (alert) => {
-    let labels = {};
+    const labels = {};
     if (config.ADDITIONAL_LABELS) {
         for (const label of config.ADDITIONAL_LABELS.split(',')) {
             const value = getAlertValue(alert, label);
